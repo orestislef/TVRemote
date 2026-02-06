@@ -56,10 +56,14 @@ struct PairingView: View {
 
                 case .waitingForCode:
                     VStack(spacing: 16) {
-                        Text("Enter the code shown on your TV")
+                        Text("Enter the hex code shown on your TV")
                             .font(.headline)
 
-                        TextField("Code (e.g. A1B2C3)", text: $pinCode)
+                        Text("Only characters 0-9 and A-F")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        TextField("Hex code (e.g. A1B2C3)", text: $pinCode)
                             .textFieldStyle(.roundedBorder)
                             .font(.title3.monospaced())
                             .multilineTextAlignment(.center)
@@ -69,13 +73,8 @@ struct PairingView: View {
                         Button {
                             submitCode()
                         } label: {
-                            HStack {
-                                if tvManager.pairing.state == .verifying {
-                                    ProgressView().tint(.white)
-                                }
-                                Text("Submit")
-                            }
-                            .frame(maxWidth: .infinity)
+                            Text("Submit")
+                                .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(pinCode.count < 4)
@@ -127,6 +126,14 @@ struct PairingView: View {
         .padding()
         .navigationTitle("Pair TV")
         .navigationBarTitleDisplayMode(.inline)
+        .onDisappear {
+            // Cancel any in-progress pairing when navigating away
+            if tvManager.pairing.state != .success {
+                tvManager.pairing.cancel()
+            }
+            pinCode = ""
+            errorMessage = nil
+        }
     }
 
     private func startPairing() {

@@ -67,8 +67,5 @@ struct DiscoveryView: View {
         .onAppear {
             tvManager.discovery.startDiscovery()
         }
-        .onDisappear {
-            tvManager.discovery.stopDiscovery()
-        }
     }
 }

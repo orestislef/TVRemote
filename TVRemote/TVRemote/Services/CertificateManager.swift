@@ -17,6 +17,24 @@ final class CertificateManager {
     static let shared = CertificateManager()
     private let keyTag = "gr.orestislef.TVRemote.clientkey"
     private let certLabel = "TVRemote Client"
+    private static let certVersion = 2
+    private static let certVersionKey = "TVRemote_certVersion"
+
+    private init() {
+        migrateIfNeeded()
+    }
+
+    /// Delete malformed certificates from previous versions.
+    private func migrateIfNeeded() {
+        let current = UserDefaults.standard.integer(forKey: Self.certVersionKey)
+        if current < Self.certVersion {
+            log.info("Certificate migration v\(current) → v\(Self.certVersion), cleaning up old artifacts...")
+            deleteExistingKey()
+            deleteExistingCert()
+            UserDefaults.standard.set(Self.certVersion, forKey: Self.certVersionKey)
+            log.info("Certificate migration complete, identity will regenerate on next use")
+        }
+    }
 
     // MARK: - Public API
 
@@ -250,7 +268,7 @@ final class CertificateManager {
         algo.append(derOID([0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]))
         algo.append(derNull())
         info.append(derSequence(algo))
-        info.append(derBitString(derSequence(pkcs1Key)))
+        info.append(derBitString(pkcs1Key))
         return derSequence(info)
     }
 

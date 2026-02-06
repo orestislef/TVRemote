@@ -17,7 +17,6 @@ final class BonjourDiscovery {
             log.info("Discovery already running, skipping")
             return
         }
-        discoveredDevices.removeAll()
         isSearching = true
         log.info("Starting Bonjour discovery for _androidtvremote2._tcp")
 
@@ -67,7 +66,7 @@ final class BonjourDiscovery {
     private func handleResults(_ results: Set<NWBrowser.Result>) {
         for result in results {
             if case let .service(name, type, domain, interface) = result.endpoint {
-                log.info("Found service: name='\(name)' type='\(type)' domain='\(domain ?? "nil")' interface=\(String(describing: interface))")
+                log.info("Found service: name='\(name)' type='\(type)' domain='\(domain)' interface=\(String(describing: interface))")
                 resolveService(result: result, name: name)
             }
         }
@@ -75,14 +74,18 @@ final class BonjourDiscovery {
 
     private func resolveService(result: NWBrowser.Result, name: String) {
         log.info("Resolving service '\(name)'...")
-        let params = NWParameters.tcp
-        let connection = NWConnection(to: result.endpoint, using: params)
+        // Use UDP — no handshake needed, so resolution succeeds even if the
+        // service port expects TLS (which would stall a plain TCP connection).
+        let connection = NWConnection(to: result.endpoint, using: .udp)
+        var resolved = false
 
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
+                guard !resolved else { return }
                 if let path = connection.currentPath,
                    let endpoint = path.remoteEndpoint {
+                    resolved = true
                     log.info("Resolved '\(name)' -> endpoint: \(String(describing: endpoint))")
                     Task { @MainActor in
                         self?.addResolved(name: name, endpoint: endpoint)
@@ -103,7 +106,7 @@ final class BonjourDiscovery {
         connection.start(queue: .main)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            if connection.state != .cancelled {
+            if !resolved && connection.state != .cancelled {
                 log.warning("Resolution timeout for '\(name)', cancelling")
                 connection.cancel()
             }
@@ -112,7 +115,7 @@ final class BonjourDiscovery {
 
     private func addResolved(name: String, endpoint: NWEndpoint) {
         if case let .hostPort(host, port) = endpoint {
-            let hostStr: String
+            var hostStr: String
             switch host {
             case .ipv4(let addr):
                 hostStr = "\(addr)"
@@ -122,6 +125,10 @@ final class BonjourDiscovery {
                 hostStr = hostname
             @unknown default:
                 hostStr = "\(host)"
+            }
+            // Strip interface scope suffix (e.g. "%en0") from IPv4 addresses
+            if let pct = hostStr.firstIndex(of: "%") {
+                hostStr = String(hostStr[..<pct])
             }
 
             let device = TVDevice(

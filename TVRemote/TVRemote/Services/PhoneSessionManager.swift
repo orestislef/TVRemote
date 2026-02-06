@@ -4,7 +4,7 @@ import WatchConnectivity
 import Observation
 import os
 
-private let log = Logger(subsystem: "gr.orestislef.TVRemote", category: "PhoneSession")
+nonisolated(unsafe) private let log = Logger(subsystem: "gr.orestislef.TVRemote", category: "PhoneSession")
 
 @Observable
 final class PhoneSessionManager: NSObject, WCSessionDelegate {

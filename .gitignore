@@ -1,35 +1,13 @@
+# macOS
+.DS_Store
+
 # Xcode
-*.xcodeproj/xcuserdata/
-*.xcodeproj/project.xcworkspace/xcuserdata/
-*.xcworkspace/xcuserdata/
-DerivedData/
-build/
-*.moved-aside
-*.pbxuser
-!default.pbxuser
-*.mode1v3
-!default.mode1v3
-*.mode2v3
-!default.mode2v3
-*.perspectivev3
-!default.perspectivev3
+TVRemote/build/
+*.xcuserdata
 xcuserdata/
-*.xccheckout
+DerivedData/
 *.xcscmblueprint
 
 # Swift Package Manager
 .build/
 Packages/
-Package.pins
-Package.resolved
-
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
-._*
-
-# Temporary files
-*.swp
-*.swo
-*~

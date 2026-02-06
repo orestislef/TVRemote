@@ -3,7 +3,7 @@ import Network
 import Security
 import os
 
-private let log = Logger(subsystem: "gr.orestislef.TVRemote", category: "Connection")
+nonisolated(unsafe) private let log = Logger(subsystem: "gr.orestislef.TVRemote", category: "Connection")
 
 enum ConnectionError: Error, LocalizedError {
     case noIdentity
@@ -69,18 +69,16 @@ final class AndroidTVConnection {
         log.info("Connecting to \(device.host):\(device.port) via TLS...")
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            conn.stateUpdateHandler = { [weak self] state in
+            conn.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
                     log.info("TLS connection READY (remote port)")
                     cont.resume()
                 case .failed(let error):
                     log.error("TLS connection FAILED: \(error.localizedDescription)")
-                    self?.isConnected = false
                     cont.resume(throwing: ConnectionError.connectionFailed(error.localizedDescription))
                 case .cancelled:
                     log.info("TLS connection CANCELLED")
-                    self?.isConnected = false
                     cont.resume(throwing: ConnectionError.connectionFailed("Cancelled"))
                 case .waiting(let error):
                     log.warning("TLS connection WAITING: \(error.localizedDescription)")
@@ -96,7 +94,9 @@ final class AndroidTVConnection {
         conn.stateUpdateHandler = { [weak self] state in
             if case .failed(let error) = state {
                 log.error("Remote connection lost: \(error.localizedDescription)")
-                self?.isConnected = false
+                Task { @MainActor [weak self] in
+                    self?.isConnected = false
+                }
             }
         }
 
