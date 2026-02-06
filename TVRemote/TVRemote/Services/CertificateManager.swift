@@ -17,7 +17,7 @@ final class CertificateManager {
     static let shared = CertificateManager()
     private let keyTag = "gr.orestislef.TVRemote.clientkey"
     private let certLabel = "TVRemote Client"
-    private static let certVersion = 2
+    private static let certVersion = 3
     private static let certVersionKey = "TVRemote_certVersion"
 
     private init() {
@@ -225,6 +225,7 @@ final class CertificateManager {
 
     private func buildTBSCertificate(publicKeyPKCS1: Data) -> Data {
         var tbs = Data()
+        // Version: v3 (needed for extensions)
         tbs.append(derExplicit(tag: 0, derInteger(Data([2]))))
 
         var serial = Data(count: 8)
@@ -236,7 +237,22 @@ final class CertificateManager {
         tbs.append(buildValidity())
         tbs.append(buildName("atvremote"))
         tbs.append(buildSubjectPublicKeyInfo(publicKeyPKCS1))
+        // X.509v3 extensions (explicit tag [3])
+        tbs.append(derExplicit(tag: 3, derSequence(buildExtensions())))
         return derSequence(tbs)
+    }
+
+    private func buildExtensions() -> Data {
+        var extensions = Data()
+        // Basic Constraints: critical, CA=TRUE
+        // OID 2.5.29.19 = 55 1D 13
+        var basicConstraints = Data()
+        basicConstraints.append(derOID([0x55, 0x1D, 0x13]))
+        basicConstraints.append(derTag(0x01, Data([0xFF]))) // critical = TRUE
+        // extnValue: OCTET STRING wrapping SEQUENCE { BOOLEAN TRUE (cA) }
+        basicConstraints.append(derTag(0x04, derSequence(derTag(0x01, Data([0xFF])))))
+        extensions.append(derSequence(basicConstraints))
+        return extensions
     }
 
     private func sha256WithRSAAlgorithm() -> Data {

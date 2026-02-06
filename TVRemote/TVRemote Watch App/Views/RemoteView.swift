@@ -5,27 +5,47 @@ struct RemoteView: View {
     let onCommand: (RemoteCommand) -> Void
     let onDisconnect: () -> Void
 
-    @State private var showMediaControls = false
+    @Environment(\.dismiss) private var dismiss
+    @State private var showMedia = false
 
     var body: some View {
-        TabView {
-            ScrollView {
+        ScrollView {
+            if showMedia {
+                MediaControlView(onCommand: onCommand)
+            } else {
                 DPadView(onCommand: onCommand)
             }
 
-            ScrollView {
-                MediaControlView(onCommand: onCommand)
+            // Toggle
+            Button {
+                withAnimation {
+                    showMedia.toggle()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: showMedia ? "dpad.fill" : "slider.horizontal.3")
+                    Text(showMedia ? "D-Pad" : "Media")
+                }
+                .font(.caption2)
+                .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.bordered)
+            .tint(.blue)
         }
-        .tabViewStyle(.verticalPage)
         .navigationTitle(deviceName)
+        .navigationBarBackButtonHidden(true)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
+                Button { dismiss() } label: {
+                    Image(systemName: "chevron.left")
+                }
+            }
+            ToolbarItem(placement: .confirmationAction) {
                 Button {
                     onDisconnect()
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.red)
                 }
             }
         }

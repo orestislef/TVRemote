@@ -3,7 +3,7 @@ import Network
 import Security
 import os
 
-private let log = Logger(subsystem: "gr.orestislef.TVRemote.watchkitapp", category: "TVConnection")
+nonisolated(unsafe) private let log = Logger(subsystem: "gr.orestislef.TVRemote.watchkitapp", category: "TVConnection")
 
 enum WatchConnectionError: Error, LocalizedError {
     case noIdentity
@@ -142,14 +142,15 @@ final class WatchTVConnection {
         receiveBuffer = Data()
     }
 
-    func sendCommand(_ command: RemoteCommand) {
-        guard isConnected else {
+    func sendCommand(_ command: RemoteCommand) -> Bool {
+        guard isConnected, connection != nil else {
             log.warning("sendCommand(\(command.rawValue)): not connected")
-            return
+            return false
         }
         log.info("Sending command: \(command.rawValue) (keyCode=\(command.keyCode))")
         let msg = buildKeyInject(keyCode: command.keyCode, direction: 3)
         send(msg)
+        return true
     }
 
     // MARK: - Message Building
@@ -207,9 +208,12 @@ final class WatchTVConnection {
 
     private func send(_ data: Data) {
         log.debug("Sending \(data.count) bytes")
-        connection?.send(content: data, completion: .contentProcessed { error in
+        connection?.send(content: data, completion: .contentProcessed { [weak self] error in
             if let error {
                 log.error("Send error: \(error.localizedDescription)")
+                Task { @MainActor [weak self] in
+                    self?.isConnected = false
+                }
             }
         })
     }

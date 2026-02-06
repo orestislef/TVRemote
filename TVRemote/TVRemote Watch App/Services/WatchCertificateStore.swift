@@ -2,7 +2,7 @@ import Foundation
 import Security
 import os
 
-private let log = Logger(subsystem: "gr.orestislef.TVRemote.watchkitapp", category: "CertStore")
+nonisolated(unsafe) private let log = Logger(subsystem: "gr.orestislef.TVRemote.watchkitapp", category: "CertStore")
 
 /// Stores and retrieves the TLS client identity on the Watch keychain.
 /// The identity (private key + certificate) is transferred from iPhone after pairing.

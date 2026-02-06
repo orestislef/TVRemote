@@ -3,7 +3,7 @@ import WatchConnectivity
 import Observation
 import os
 
-private let log = Logger(subsystem: "gr.orestislef.TVRemote.watchkitapp", category: "WatchSession")
+nonisolated(unsafe) private let log = Logger(subsystem: "gr.orestislef.TVRemote.watchkitapp", category: "WatchSession")
 
 @Observable
 final class WatchSessionManager: NSObject, WCSessionDelegate {
@@ -41,11 +41,26 @@ final class WatchSessionManager: NSObject, WCSessionDelegate {
             return
         }
 
-        // Try direct connection first if we have a certificate
+        isConnecting = true
+        lastError = nil
+
+        // Always ask iPhone to connect too (so proxy commands work)
+        if isPhoneReachable {
+            log.info("Asking iPhone to connect to '\(device.displayName)' for proxy fallback")
+            WCSession.default.sendMessage(
+                ["action": "connect", "deviceId": device.id],
+                replyHandler: { reply in
+                    log.info("iPhone connect reply: \(reply)")
+                },
+                errorHandler: { error in
+                    log.warning("iPhone connect request failed: \(error.localizedDescription)")
+                }
+            )
+        }
+
+        // Try direct connection if we have a certificate
         if hasCertificate {
             log.info("Attempting DIRECT connection to '\(device.displayName)' host=\(device.host):\(device.port)")
-            isConnecting = true
-            lastError = nil
             Task {
                 do {
                     try await tvConnection.connect(to: device)
@@ -54,22 +69,24 @@ final class WatchSessionManager: NSObject, WCSessionDelegate {
                     log.info("Direct connection SUCCESS to '\(device.displayName)'")
                 } catch {
                     log.error("Direct connection FAILED: \(error.localizedDescription)")
-                    isConnecting = false
-                    // Fallback to iPhone proxy if phone is reachable
+                    // Still mark connected if iPhone proxy is available
                     if isPhoneReachable {
-                        log.info("Falling back to iPhone proxy connection")
-                        connectViaPhone(device)
+                        log.info("Using iPhone proxy for commands")
+                        connectedDeviceId = device.id
                     } else {
                         lastError = error.localizedDescription
                     }
+                    isConnecting = false
                 }
             }
         } else if isPhoneReachable {
-            log.info("No certificate on Watch, connecting via iPhone proxy")
-            connectViaPhone(device)
+            log.info("No certificate on Watch, using iPhone proxy")
+            connectedDeviceId = device.id
+            isConnecting = false
         } else {
             log.error("No certificate and iPhone not reachable — cannot connect")
             lastError = "Open iPhone app to set up pairing first"
+            isConnecting = false
         }
     }
 
@@ -89,15 +106,22 @@ final class WatchSessionManager: NSObject, WCSessionDelegate {
     }
 
     func sendCommand(_ command: RemoteCommand) {
-        // Use direct connection if available
-        if tvConnection.isConnected {
-            log.info("Sending command DIRECT: \(command.rawValue)")
-            tvConnection.sendCommand(command)
-        } else if isPhoneReachable {
+        // Try direct connection first
+        if tvConnection.isConnected && tvConnection.sendCommand(command) {
+            log.info("Sent command DIRECT: \(command.rawValue)")
+            return
+        }
+
+        // Fallback to iPhone proxy
+        if isPhoneReachable {
             log.info("Sending command via iPhone: \(command.rawValue)")
             WCSession.default.sendMessage(
                 ["action": "command", "command": command.rawValue],
-                replyHandler: nil,
+                replyHandler: { reply in
+                    if let error = reply["error"] as? String {
+                        log.error("iPhone command error: \(error)")
+                    }
+                },
                 errorHandler: { error in
                     log.error("Command relay error: \(error.localizedDescription)")
                 }

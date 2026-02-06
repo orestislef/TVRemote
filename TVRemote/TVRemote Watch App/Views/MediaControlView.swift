@@ -5,19 +5,6 @@ struct MediaControlView: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            // Power button top-right
-            HStack {
-                Spacer()
-                Button { onCommand(.power) } label: {
-                    Image(systemName: "power")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-                .buttonStyle(.bordered)
-                .tint(.red)
-                .clipShape(Circle())
-            }
-
             // Volume
             VStack(spacing: 4) {
                 Text("Volume")
@@ -72,17 +59,6 @@ struct MediaControlView: View {
                     .buttonStyle(.bordered)
                 }
             }
-
-            // Back button
-            Button { onCommand(.back) } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.uturn.backward")
-                    Text("Back")
-                }
-                .font(.caption)
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
         }
     }
 }
