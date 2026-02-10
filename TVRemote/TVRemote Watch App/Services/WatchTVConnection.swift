@@ -41,6 +41,12 @@ final class WatchTVConnection {
 
         let tlsOptions = NWProtocolTLS.Options()
 
+        // Force TLS 1.2 for compatibility with real Android TV devices
+        sec_protocol_options_set_min_tls_protocol_version(
+            tlsOptions.securityProtocolOptions, .TLSv12)
+        sec_protocol_options_set_max_tls_protocol_version(
+            tlsOptions.securityProtocolOptions, .TLSv12)
+
         sec_protocol_options_set_local_identity(
             tlsOptions.securityProtocolOptions,
             sec_identity_create(identity)!

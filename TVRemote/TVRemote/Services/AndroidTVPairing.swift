@@ -75,11 +75,19 @@ final class AndroidTVPairing {
         // Connect to pairing port via TLS
         let tlsOptions = NWProtocolTLS.Options()
 
+        // Force TLS 1.2 — many real Android TVs (Android 9/10) don't support TLS 1.3.
+        // Without this, iOS defaults to TLS 1.3, which causes a silent handshake failure
+        // and the TV never shows the pairing dialog.
+        sec_protocol_options_set_min_tls_protocol_version(
+            tlsOptions.securityProtocolOptions, .TLSv12)
+        sec_protocol_options_set_max_tls_protocol_version(
+            tlsOptions.securityProtocolOptions, .TLSv12)
+
         sec_protocol_options_set_local_identity(
             tlsOptions.securityProtocolOptions,
             sec_identity_create(identity)!
         )
-        log.info("TLS local identity set")
+        log.info("TLS local identity set (forced TLS 1.2)")
 
         sec_protocol_options_set_verify_block(
             tlsOptions.securityProtocolOptions,
