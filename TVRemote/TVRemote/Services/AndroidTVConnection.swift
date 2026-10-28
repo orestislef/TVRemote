@@ -29,6 +29,10 @@ enum ConnectionError: Error, LocalizedError {
 final class AndroidTVConnection {
     var isConnected = false
     var deviceName: String?
+    var currentApp: String = ""
+    var volumeLevel: Int = 0
+    var volumeMax: Int = 100
+    var volumeMuted = false
 
     private var connection: NWConnection?
     private var receiveBuffer = Data()
@@ -94,6 +98,10 @@ final class AndroidTVConnection {
         self.features = defaultFeatureMask
         self.handshakeDone = false
         self.receiveBuffer = Data()
+        self.currentApp = ""
+        self.volumeLevel = 0
+        self.volumeMax = 100
+        self.volumeMuted = false
 
         log.info("Connecting to \(device.host):\(device.port) via TLS...")
 
@@ -221,6 +229,44 @@ final class AndroidTVConnection {
                 }
                 print("[CONN] ping \(val) → replying")
                 return buildPingResponse(val: val)
+            case (20, 2): // remote_ime_key_inject → current app
+                let body = decoder.readLengthDelimited()
+                var b = ProtobufDecoder(data: body)
+                while let t = b.readTag() {
+                    if t.field == 1 && t.wireType == 2 { // app_info
+                        var app = ProtobufDecoder(data: b.readLengthDelimited())
+                        var label = ""
+                        var pkg = ""
+                        while let at = app.readTag() {
+                            if at.field == 10 && at.wireType == 2 { label = app.readString() }
+                            else if at.field == 12 && at.wireType == 2 { pkg = app.readString() }
+                            else { app.skip(wireType: at.wireType) }
+                        }
+                        let reveal = label.isEmpty ? pkg : label
+                        if !reveal.isEmpty && reveal != currentApp {
+                            currentApp = reveal
+                            print("[CONN] current app: \(reveal)")
+                        }
+                    } else { b.skip(wireType: t.wireType) }
+                }
+            case (50, 2): // remote_set_volume_level → volume state
+                let body = decoder.readLengthDelimited()
+                var b = ProtobufDecoder(data: body)
+                var level = -1
+                var max = -1
+                var muted: Bool?
+                while let t = b.readTag() {
+                    switch (t.field, t.wireType) {
+                    case (6, 0): max = Int(b.readVarint())
+                    case (7, 0): level = Int(b.readVarint())
+                    case (8, 0): muted = b.readVarint() != 0
+                    default: b.skip(wireType: t.wireType)
+                    }
+                }
+                if level >= 0 { volumeLevel = level }
+                if max >= 0 { volumeMax = max }
+                if let muted { volumeMuted = muted }
+                print("[CONN] volume=\(volumeLevel)/\(volumeMax) muted=\(volumeMuted)")
             case (3, 2): // remote_error
                 let body = decoder.readLengthDelimited()
                 var b = ProtobufDecoder(data: body)

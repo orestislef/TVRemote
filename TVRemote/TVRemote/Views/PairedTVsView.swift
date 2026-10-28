@@ -96,6 +96,12 @@ struct QuickRemoteControls: View {
         case .home: return "house"
         case .channelUp: return "arrow.up.bin"
         case .channelDown: return "arrow.down.bin"
+        case .playPause: return "playpause"
+        case .stop: return "stop"
+        case .next: return "forward.end"
+        case .previous: return "backward.end"
+        case .rewind: return "backward"
+        case .fastForward: return "forward"
         }
     }
 }
