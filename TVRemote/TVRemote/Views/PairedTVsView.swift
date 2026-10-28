@@ -14,39 +14,32 @@ struct PairedTVsView: View {
             }
 
             ForEach(tvManager.pairedDevices) { device in
-                HStack {
-                    Image(systemName: "tv.fill")
-                        .font(.title2)
-                        .foregroundStyle(tvManager.activeDevice?.id == device.id ? .green : .blue)
+                NavigationLink {
+                    PhoneRemoteView(device: device)
+                } label: {
+                    HStack {
+                        Image(systemName: "tv.fill")
+                            .font(.title2)
+                            .foregroundStyle(tvManager.activeDevice?.id == device.id ? .green : .blue)
 
-                    VStack(alignment: .leading) {
-                        Text(device.displayName)
-                            .font(.headline)
-                        Text(device.host)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        if tvManager.activeDevice?.id == device.id {
-                            Text("Connected")
-                                .font(.caption2)
-                                .foregroundStyle(.green)
-                        }
-                    }
-
-                    Spacer()
-
-                    if tvManager.activeDevice?.id == device.id {
-                        Button("Disconnect") {
-                            tvManager.disconnect()
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(.red)
-                    } else {
-                        Button("Connect") {
-                            Task {
-                                try? await tvManager.connectToDevice(device)
+                        VStack(alignment: .leading) {
+                            Text(device.displayName)
+                                .font(.headline)
+                            Text(device.host)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if tvManager.activeDevice?.id == device.id {
+                                Text("Connected")
+                                    .font(.caption2)
+                                    .foregroundStyle(.green)
                             }
                         }
-                        .buttonStyle(.bordered)
+
+                        Spacer()
+
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
@@ -59,8 +52,8 @@ struct PairedTVsView: View {
             }
 
             if tvManager.remoteConnection.isConnected {
-                Section("Remote Control") {
-                    PhoneRemoteView()
+                Section("Quick Controls") {
+                    QuickRemoteControls()
                 }
             }
         }
@@ -68,70 +61,41 @@ struct PairedTVsView: View {
     }
 }
 
-// MARK: - Simple Phone Remote (for testing)
+// MARK: - Compact inline remote shown under the paired list
 
-struct PhoneRemoteView: View {
+struct QuickRemoteControls: View {
     @Environment(TVManager.self) private var tvManager
 
     var body: some View {
-        VStack(spacing: 16) {
-            // Power
-            HStack {
-                Spacer()
-                Button { tvManager.sendCommand(.power) } label: {
-                    Image(systemName: "power")
-                        .font(.title2)
-                        .foregroundStyle(.red)
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach([RemoteCommand.power, .volumeUp, .volumeDown, .mute, .up, .down, .left, .right, .ok, .back, .home, .channelUp, .channelDown], id: \.self) { cmd in
+                    Button { tvManager.sendCommand(cmd) } label: {
+                        Image(systemName: iconName(for: cmd))
+                            .frame(width: 44, height: 40)
+                    }
+                    .buttonStyle(.bordered)
                 }
-                .buttonStyle(.bordered)
             }
-
-            // D-Pad
-            VStack(spacing: 4) {
-                remoteButton(.up, icon: "chevron.up")
-                HStack(spacing: 4) {
-                    remoteButton(.left, icon: "chevron.left")
-                    remoteButton(.ok, label: "OK")
-                    remoteButton(.right, icon: "chevron.right")
-                }
-                remoteButton(.down, icon: "chevron.down")
-            }
-
-            HStack(spacing: 20) {
-                remoteButton(.back, icon: "arrow.uturn.backward")
-                remoteButton(.home, icon: "house")
-            }
-
-            // Volume
-            HStack(spacing: 20) {
-                remoteButton(.volumeDown, icon: "speaker.minus")
-                remoteButton(.mute, icon: "speaker.slash")
-                remoteButton(.volumeUp, icon: "speaker.plus")
-            }
-
-            // Channels
-            HStack(spacing: 20) {
-                remoteButton(.channelDown, label: "CH-")
-                remoteButton(.channelUp, label: "CH+")
-            }
+            .padding(.vertical, 2)
         }
-        .padding()
     }
 
-    private func remoteButton(_ cmd: RemoteCommand, icon: String? = nil, label: String? = nil) -> some View {
-        Button {
-            tvManager.sendCommand(cmd)
-        } label: {
-            if let icon {
-                Image(systemName: icon)
-                    .font(.title3)
-                    .frame(width: 56, height: 44)
-            } else if let label {
-                Text(label)
-                    .font(.headline)
-                    .frame(width: 56, height: 44)
-            }
+    private func iconName(for cmd: RemoteCommand) -> String {
+        switch cmd {
+        case .power: return "power"
+        case .volumeUp: return "speaker.plus"
+        case .volumeDown: return "speaker.minus"
+        case .mute: return "speaker.slash"
+        case .up: return "chevron.up"
+        case .down: return "chevron.down"
+        case .left: return "chevron.left"
+        case .right: return "chevron.right"
+        case .ok: return "circle.fill"
+        case .back: return "arrow.uturn.backward"
+        case .home: return "house"
+        case .channelUp: return "arrow.up.bin"
+        case .channelDown: return "arrow.down.bin"
         }
-        .buttonStyle(.bordered)
     }
 }

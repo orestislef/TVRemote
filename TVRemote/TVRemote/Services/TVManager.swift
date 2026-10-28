@@ -2,6 +2,15 @@ import Foundation
 import Observation
 import os
 
+// TVDevice is defined in Models/TVDevice.swift
+// RemoteCommand is defined in Models/RemoteCommand.swift
+// BonjourDiscovery is defined in Services/BonjourDiscovery.swift
+// AndroidTVPairing is defined in Services/AndroidTVPairing.swift
+// AndroidTVConnection is defined in Services/AndroidTVConnection.swift
+
+// Attempting to import the module to see if it resolves visibility issues
+// import TVRemote
+
 private let log = Logger(subsystem: "gr.orestislef.TVRemote", category: "TVManager")
 
 @Observable
@@ -19,6 +28,22 @@ final class TVManager {
         log.info("TVManager initializing...")
         loadPairedDevices()
         log.info("TVManager ready, \(self.pairedDevices.count) paired device(s) loaded")
+        autoConnect()
+    }
+
+    /// Automatically connects to the saved paired TV on app launch so the
+    /// remote controls are immediately available.
+    private func autoConnect() {
+        guard let device = pairedDevices.first else { return }
+        log.info("Auto-connecting to '\(device.displayName)'")
+        Task {
+            do {
+                try await connectToDevice(device)
+                log.info("Auto-connect succeeded for '\(device.displayName)'")
+            } catch {
+                log.warning("Auto-connect failed for '\(device.displayName)': \(error.localizedDescription) — user can connect manually")
+            }
+        }
     }
 
     // MARK: - Device Management

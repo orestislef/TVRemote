@@ -3,6 +3,7 @@ import Network
 import Observation
 import os
 
+@MainActor
 private let log = Logger(subsystem: "gr.orestislef.TVRemote", category: "Bonjour")
 
 @Observable
@@ -18,7 +19,7 @@ final class BonjourDiscovery {
             return
         }
         isSearching = true
-        log.info("Starting Bonjour discovery for _androidtvremote2._tcp")
+        print("[DISC] Starting Bonjour discovery for _androidtvremote2._tcp")
 
         let params = NWParameters()
         params.includePeerToPeer = true
@@ -30,15 +31,15 @@ final class BonjourDiscovery {
             Task { @MainActor in
                 switch state {
                 case .ready:
-                    log.info("Browser state: ready - listening for services")
+                    print("[DISC] Browser state: ready")
                 case .failed(let error):
-                    log.error("Browser state: FAILED - \(error.localizedDescription)")
+                    print("[DISC] Browser state: FAILED - \(error.localizedDescription)")
                     self?.isSearching = false
                 case .cancelled:
                     log.info("Browser state: cancelled")
                     self?.isSearching = false
                 case .waiting(let error):
-                    log.warning("Browser state: waiting - \(error.localizedDescription)")
+                    print("[DISC] Browser state: WAITING - \(error.localizedDescription) (code \((error as? NWError)?.errorCode ?? -1))")
                 default:
                     log.debug("Browser state: \(String(describing: state))")
                 }
@@ -47,7 +48,7 @@ final class BonjourDiscovery {
 
         browser.browseResultsChangedHandler = { [weak self] results, changes in
             Task { @MainActor in
-                log.info("Browse results changed: \(results.count) results, \(changes.count) changes")
+                print("[DISC] Browse results changed: \(results.count) results, \(changes.count) changes")
                 self?.handleResults(results)
             }
         }
@@ -66,85 +67,98 @@ final class BonjourDiscovery {
     private func handleResults(_ results: Set<NWBrowser.Result>) {
         for result in results {
             if case let .service(name, type, domain, interface) = result.endpoint {
-                log.info("Found service: name='\(name)' type='\(type)' domain='\(domain)' interface=\(String(describing: interface))")
+                print("[DISC] Found service: name='\(name)' type='\(type)' domain='\(domain)'")
                 resolveService(result: result, name: name)
             }
         }
     }
 
+    private var pendingResolvers: [ServiceResolver] = []
+
     private func resolveService(result: NWBrowser.Result, name: String) {
-        log.info("Resolving service '\(name)'...")
-        // Use UDP — no handshake needed, so resolution succeeds even if the
-        // service port expects TLS (which would stall a plain TCP connection).
-        let connection = NWConnection(to: result.endpoint, using: .udp)
-        var resolved = false
-
-        connection.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                guard !resolved else { return }
-                if let path = connection.currentPath,
-                   let endpoint = path.remoteEndpoint {
-                    resolved = true
-                    log.info("Resolved '\(name)' -> endpoint: \(String(describing: endpoint))")
-                    Task { @MainActor in
-                        self?.addResolved(name: name, endpoint: endpoint)
-                    }
-                } else {
-                    log.warning("Resolved '\(name)' but no remote endpoint available")
+        print("[DISC] Resolving service '\(name)' via NSNetService...")
+        let resolver = ServiceResolver(name: name) { [weak self] ipv4, port in
+            Task { @MainActor in
+                guard let self, let ipv4 else {
+                    print("[DISC] Resolution failed for '\(name)'")
+                    return
                 }
-                connection.cancel()
-            case .failed(let error):
-                log.error("Failed to resolve '\(name)': \(error.localizedDescription)")
-                connection.cancel()
-            case .waiting(let error):
-                log.warning("Waiting to resolve '\(name)': \(error.localizedDescription)")
-            default:
-                break
+                print("[DISC] ADDED DEVICE: '\(name)' at \(ipv4):\(port)")
+                let device = TVDevice(
+                    id: "\(ipv4):\(port)",
+                    name: name,
+                    host: ipv4,
+                    port: Int(port),
+                    isPaired: false
+                )
+                if !self.discoveredDevices.contains(where: { $0.id == device.id }) {
+                    self.discoveredDevices.append(device)
+                }
             }
         }
-        connection.start(queue: .main)
+        pendingResolvers.append(resolver)
+        resolver.start()
+    }
+}
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            if !resolved && connection.state != .cancelled {
-                log.warning("Resolution timeout for '\(name)', cancelling")
-                connection.cancel()
-            }
+final class ServiceResolver: NSObject, NetServiceDelegate {
+    private let service: NetService
+    private let completion: (String?, UInt16) -> Void
+    private var finished = false
+
+    init(name: String, completion: @escaping (String?, UInt16) -> Void) {
+        service = NetService(domain: "local", type: "_androidtvremote2._tcp.", name: name)
+        self.completion = completion
+        super.init()
+    }
+
+    func start() {
+        service.delegate = self
+        service.resolve(withTimeout: 6)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.5) { [weak self] in
+            guard let self, !self.finished else { return }
+            print("[DISC] NSNetService resolution timeout")
+            self.finish(nil, 0)
         }
     }
 
-    private func addResolved(name: String, endpoint: NWEndpoint) {
-        if case let .hostPort(host, port) = endpoint {
-            var hostStr: String
-            switch host {
-            case .ipv4(let addr):
-                hostStr = "\(addr)"
-            case .ipv6(let addr):
-                hostStr = "\(addr)"
-            case .name(let hostname, _):
-                hostStr = hostname
-            @unknown default:
-                hostStr = "\(host)"
-            }
-            // Strip interface scope suffix (e.g. "%en0") from IPv4 addresses
-            if let pct = hostStr.firstIndex(of: "%") {
-                hostStr = String(hostStr[..<pct])
-            }
+    private func finish(_ ip: String?, _ port: UInt16) {
+        guard !finished else { return }
+        finished = true
+        service.stop()
+        completion(ip, port)
+    }
 
-            let device = TVDevice(
-                id: "\(hostStr):\(port.rawValue)",
-                name: name,
-                host: hostStr,
-                port: Int(port.rawValue),
-                isPaired: false
-            )
-
-            if !discoveredDevices.contains(where: { $0.id == device.id }) {
-                log.info("Added device: '\(device.displayName)' at \(hostStr):\(port.rawValue)")
-                discoveredDevices.append(device)
-            } else {
-                log.debug("Device already known: '\(device.displayName)' at \(hostStr):\(port.rawValue)")
+    func netServiceDidResolveAddress(_ sender: NetService) {
+        print("[DISC] NSNetService resolved: \(sender.hostName ?? "nil") port=\(sender.port) addrs=\(sender.addresses?.count ?? 0)")
+        var port = UInt16(truncatingIfNeeded: max(sender.port, 0))
+        if port == 0 {
+            port = 6466
+            print("[DISC] Port missing from mDNS record, defaulting to 6466")
+        }
+        for addrData in sender.addresses ?? [] {
+            guard addrData.count >= MemoryLayout<sockaddr>.size else { continue }
+            let sa: sockaddr = addrData.withUnsafeBytes { $0.load(as: sockaddr.self) }
+            var saCopy = sa
+            if saCopy.sa_family == UInt8(AF_INET) {
+                let in4 = withUnsafePointer(to: &saCopy) { $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee } }
+                var addr = in4.sin_addr
+                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                if inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    let ip = String(cString: buf)
+                    print("[DISC] Got IPv4: \(ip)")
+                    finish(ip, port)
+                    return
+                }
             }
         }
+        print("[DISC] Resolved but no IPv4 address family found")
+        finish(nil, 0)
     }
+
+    func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
+        print("[DISC] NSNetService didNotResolve: \(errorDict)")
+        finish(nil, 0)
+    }
+
 }

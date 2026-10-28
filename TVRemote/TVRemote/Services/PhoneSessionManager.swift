@@ -42,7 +42,7 @@ final class PhoneSessionManager: NSObject, WCSessionDelegate {
     }
 
     func openWatchAppSettings() {
-        log.info("Opening Watch app settings via itms-watchs://")
+        log.info("Opening Apple Watch companion app via itms-watchs://")
         if let url = URL(string: "itms-watchs://") {
             UIApplication.shared.open(url)
         }
@@ -179,25 +179,30 @@ final class PhoneSessionManager: NSObject, WCSessionDelegate {
                 log.info("Replying with \(payload.count) device(s)")
                 replyHandler(["devices": payload])
 
-            case "connect":
-                if let deviceId = message["deviceId"] as? String,
-                   let device = tvManager.pairedDevices.first(where: { $0.id == deviceId }) {
-                    log.info("Watch requested connect to '\(device.displayName)' id=\(deviceId)")
-                    Task {
-                        do {
-                            try await tvManager.connectToDevice(device)
-                            log.info("Watch connect success for '\(device.displayName)'")
-                            replyHandler(["status": "connected"])
-                        } catch {
-                            log.error("Watch connect failed for '\(device.displayName)': \(error.localizedDescription)")
-                            replyHandler(["error": error.localizedDescription])
-                        }
-                    }
-                } else {
-                    let deviceId = message["deviceId"] as? String ?? "nil"
-                    log.error("Watch connect: device not found, id=\(deviceId)")
-                    replyHandler(["error": "Device not found"])
-                }
+             case "connect":
+                 if let deviceId = message["deviceId"] as? String,
+                    let device = tvManager.pairedDevices.first(where: { ($0 as? TVDevice)?.id == deviceId }) {
+                     log.info("Watch requested connect to '\((device as? TVDevice)?.displayName ?? "Unknown")' id=\(deviceId)")
+                     Task {
+                         do {
+                             if let tvDevice = device as? TVDevice {
+                                 try await tvManager.connectToDevice(tvDevice)
+                                 log.info("Watch connect success for '\(tvDevice.displayName)'")
+                                 replyHandler(["status": "connected"])
+                             } else {
+                                 log.error("Device is not a TVDevice")
+                                 replyHandler(["status": "error", "message": "Invalid device type"])
+                             }
+                         } catch {
+                             log.error("Watch connect failed: \(error.localizedDescription)")
+                             replyHandler(["status": "error", "message": error.localizedDescription])
+                         }
+                     }
+                 } else {
+                     let deviceId = message["deviceId"] as? String ?? "nil"
+                     log.error("Watch connect: device not found, id=\(deviceId)")
+                     replyHandler(["error": "Device not found"])
+                 }
 
             case "disconnect":
                 log.info("Watch requested disconnect")
