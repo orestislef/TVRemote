@@ -74,6 +74,11 @@ final class TVManager {
     // MARK: - Connection
 
     func connectToDevice(_ device: TVDevice) async throws {
+        // Idempotent: skip if already connected to this device
+        if activeDevice?.id == device.id && remoteConnection.isConnected {
+            log.info("Already connected to '\(device.displayName)', reusing session")
+            return
+        }
         log.info("Connecting to device: '\(device.displayName)' host=\(device.host):\(device.port)")
         try await remoteConnection.connect(to: device)
         activeDevice = device
