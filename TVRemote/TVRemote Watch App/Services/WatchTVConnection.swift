@@ -5,6 +5,10 @@ import os
 
 nonisolated(unsafe) private let log = Logger(subsystem: "gr.orestislef.TVRemote.watchkitapp", category: "TVConnection")
 
+/// Feature bitmask matching the reference client (no voice/mic):
+/// PING|KEY|IME|POWER|VOLUME|APP_LINK = 1|2|4|32|64|512
+private let defaultFeatureMask: UInt64 = 615
+
 enum WatchConnectionError: Error, LocalizedError {
     case noIdentity
     case connectionFailed(String)
@@ -28,7 +32,8 @@ final class WatchTVConnection {
 
     private var connection: NWConnection?
     private var receiveBuffer = Data()
-    private var configDone = false
+    private var features: UInt64 = defaultFeatureMask
+    private var handshakeDone = false
 
     func connect(to device: TVDevice) async throws {
         log.info("=== WATCH DIRECT CONNECT === device='\(device.displayName)' host=\(device.host) port=\(device.port)")
@@ -67,7 +72,9 @@ final class WatchTVConnection {
 
         self.connection = conn
         self.deviceName = device.displayName
-        self.configDone = false
+        self.features = defaultFeatureMask
+        self.handshakeDone = false
+        self.receiveBuffer = Data()
 
         log.info("Connecting to \(device.host):\(device.port) via TLS from Watch...")
 
@@ -122,18 +129,21 @@ final class WatchTVConnection {
 
         startReceiving()
 
-        // Send configuration
-        log.info("Sending RemoteConfigure (code1=622, device=AppleWatch/Apple)")
-        let configMsg = buildRemoteConfigure()
-        send(configMsg)
+        // Handshake: the TV drives the sequence — it sends RemoteConfigure,
+        // then RemoteSetActive; the receive callback replies to each. We just
+        // poll until the dance completes.
+        var started = false
+        let handshakeDeadline = Date().addingTimeInterval(8)
 
-        // Wait for config response
-        try? await Task.sleep(for: .milliseconds(500))
+        while !started && Date() < handshakeDeadline {
+            try await Task.sleep(for: .milliseconds(150))
+            started = handshakeDone
+        }
 
-        // Send set active
-        log.info("Sending RemoteSetActive (active=622)")
-        let activeMsg = buildRemoteSetActive()
-        send(activeMsg)
+        guard started else {
+            log.error("Handshake incomplete (timeout)")
+            throw WatchConnectionError.timeout
+        }
 
         isConnected = true
         log.info("=== WATCH CONNECTED === Ready to send commands to '\(device.displayName)'")
@@ -161,41 +171,40 @@ final class WatchTVConnection {
 
     // MARK: - Message Building
 
-    private func buildRemoteConfigure() -> Data {
+    private func buildRemoteConfigureReply() -> Data {
         var deviceInfo = ProtobufEncoder()
-        deviceInfo.addString(field: 1, value: "Apple Watch")
-        deviceInfo.addString(field: 2, value: "Apple")
-        deviceInfo.addVarint(field: 3, value: UInt64(1))
-        deviceInfo.addString(field: 4, value: "1.0.0")
-        deviceInfo.addString(field: 5, value: "gr.orestislef.TVRemote")
+        deviceInfo.addVarint(field: 3, value: 1)           // unknown1
+        deviceInfo.addString(field: 4, value: "1")         // unknown2
+        deviceInfo.addString(field: 5, value: "atvremote") // package_name
+        deviceInfo.addString(field: 6, value: "1.0.0")     // app_version
 
         var configure = ProtobufEncoder()
-        configure.addVarint(field: 1, value: UInt64(622))
+        configure.addVarint(field: 1, value: features)     // code1 (feature bitmask)
         configure.addMessage(field: 2, encoder: deviceInfo)
 
         var message = ProtobufEncoder()
-        message.addMessage(field: 7, encoder: configure)
+        message.addMessage(field: 1, encoder: configure)   // remote_configure = field 1
 
         return MessageFraming.frame(message.encoded)
     }
 
-    private func buildRemoteSetActive() -> Data {
+    private func buildRemoteSetActiveReply() -> Data {
         var setActive = ProtobufEncoder()
-        setActive.addVarint(field: 1, value: UInt64(622))
+        setActive.addVarint(field: 1, value: features)     // active = feature bitmask
 
         var message = ProtobufEncoder()
-        message.addMessage(field: 8, encoder: setActive)
+        message.addMessage(field: 2, encoder: setActive)   // remote_set_active = field 2
 
         return MessageFraming.frame(message.encoded)
     }
 
     private func buildKeyInject(keyCode: Int32, direction: Int32) -> Data {
         var keyInject = ProtobufEncoder()
-        keyInject.addVarint(field: 1, value: UInt64(keyCode))
-        keyInject.addVarint(field: 2, value: UInt64(direction))
+        keyInject.addVarint(field: 1, value: UInt64(keyCode))   // key_code
+        keyInject.addVarint(field: 2, value: UInt64(direction)) // direction (SHORT=3)
 
         var message = ProtobufEncoder()
-        message.addMessage(field: 2, encoder: keyInject)
+        message.addMessage(field: 10, encoder: keyInject) // remote_key_inject = field 10
 
         return MessageFraming.frame(message.encoded)
     }
@@ -205,7 +214,7 @@ final class WatchTVConnection {
         ping.addVarint(field: 1, value: val)
 
         var message = ProtobufEncoder()
-        message.addMessage(field: 11, encoder: ping)
+        message.addMessage(field: 9, encoder: ping)        // remote_ping_response = field 9
 
         return MessageFraming.frame(message.encoded)
     }
@@ -251,35 +260,58 @@ final class WatchTVConnection {
     }
 
     private func handleMessage(_ data: Data) {
-        var decoder = ProtobufDecoder(data: data)
+        if let reply = handleHandshakeMessage(data) {
+            send(reply)
+        }
+    }
+
+    private func handleHandshakeMessage(_ payload: Data) -> Data? {
+        var decoder = ProtobufDecoder(data: payload)
         while let tag = decoder.readTag() {
-            switch tag.field {
-            case 7 where tag.wireType == 2:
-                log.info("Received RemoteConfigure response")
-                decoder.skip(wireType: tag.wireType)
-            case 8 where tag.wireType == 2:
-                log.info("Received RemoteSetActive response")
-                decoder.skip(wireType: tag.wireType)
-            case 10 where tag.wireType == 2:
-                let pingData = decoder.readLengthDelimited()
-                var pingDecoder = ProtobufDecoder(data: pingData)
-                var val: UInt64 = 0
-                while let ptag = pingDecoder.readTag() {
-                    if ptag.field == 1 && ptag.wireType == 0 {
-                        val = pingDecoder.readVarint()
-                    } else {
-                        pingDecoder.skip(wireType: ptag.wireType)
-                    }
+            switch (tag.field, tag.wireType) {
+            case (1, 2): // remote_configure from TV
+                let body = decoder.readLengthDelimited()
+                var b = ProtobufDecoder(data: body)
+                var code1: UInt64 = 0
+                while let t = b.readTag() {
+                    if t.field == 1 && t.wireType == 0 { code1 = b.readVarint() }
+                    else { b.skip(wireType: t.wireType) }
                 }
-                log.info("Received Ping (val=\(val)), sending Pong")
-                send(buildPingResponse(val: val))
-            case 40 where tag.wireType == 2:
-                log.info("Received RemoteStart message")
-                decoder.skip(wireType: tag.wireType)
+                features = min(defaultFeatureMask, code1)
+                print("[WATCH] TV features=\(code1) → using \(features)")
+                handshakeDone = true
+                return buildRemoteConfigureReply()
+            case (2, 2): // remote_set_active from TV
+                let body = decoder.readLengthDelimited()
+                var b = ProtobufDecoder(data: body)
+                while let t = b.readTag() { b.skip(wireType: t.wireType) }
+                print("[WATCH] TV SetActive → replying active=\(defaultFeatureMask)")
+                return buildRemoteSetActiveReply()
+            case (8, 2): // remote_ping_request
+                let body = decoder.readLengthDelimited()
+                var b = ProtobufDecoder(data: body)
+                var val: UInt64 = 0
+                while let t = b.readTag() {
+                    if t.field == 1 && t.wireType == 0 { val = b.readVarint() }
+                    else { b.skip(wireType: t.wireType) }
+                }
+                print("[WATCH] ping \(val) → replying")
+                return buildPingResponse(val: val)
+            case (3, 2): // remote_error
+                let body = decoder.readLengthDelimited()
+                var b = ProtobufDecoder(data: body)
+                var code: UInt64 = 0
+                while let t = b.readTag() {
+                    if t.field == 1 && t.wireType == 0 { code = b.readVarint() }
+                    else { b.skip(wireType: t.wireType) }
+                }
+                print("[WATCH] TV ERROR code=\(code)")
+                return nil
             default:
-                log.debug("Unknown message field=\(tag.field) wireType=\(tag.wireType)")
+                print("[WATCH] msg field \(tag.field)")
                 decoder.skip(wireType: tag.wireType)
             }
         }
+        return nil
     }
 }
