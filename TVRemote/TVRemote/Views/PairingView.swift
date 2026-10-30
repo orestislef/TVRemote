@@ -2,14 +2,24 @@ import SwiftUI
 
 struct PairingView: View {
     let device: TVDevice
+    let isRepair: Bool
     @Environment(TVManager.self) private var tvManager
     @Environment(\.dismiss) private var dismiss
     @State private var pinCode = ""
-    @State private var isPairing = false
-    @State private var errorMessage: String?
 
-    private var alreadyPaired: Bool {
-        tvManager.pairedDevices.contains { $0.id == device.id }
+    init(device: TVDevice, isRepair: Bool = false) {
+        self.device = device
+        self.isRepair = isRepair
+    }
+
+    /// Discovery ids change with the IP, so the paired record is matched by name too.
+    private var pairedRecord: TVDevice? {
+        tvManager.pairedRecord(matching: device)
+    }
+
+    /// Pairing adds the device before the success screen shows, so success wins here.
+    private var showsAlreadyPaired: Bool {
+        !isRepair && pairedRecord != nil && tvManager.pairing.state != .success
     }
 
     var body: some View {
@@ -25,7 +35,7 @@ struct PairingView: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
 
-            if alreadyPaired {
+            if showsAlreadyPaired {
                 Label("Already Paired", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
                     .font(.title3)
@@ -37,6 +47,13 @@ struct PairingView: View {
                 }
                 .foregroundStyle(.red)
             } else {
+                if isRepair, tvManager.pairing.state == .idle {
+                    Text("This TV no longer recognises your iPhone. Pair it again to keep using it.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+
                 switch tvManager.pairing.state {
                 case .idle, .connecting:
                     Button {
@@ -47,7 +64,7 @@ struct PairingView: View {
                                 ProgressView()
                                     .tint(.white)
                             }
-                            Text(tvManager.pairing.state == .connecting ? "Connecting..." : "Start Pairing")
+                            Text(tvManager.pairing.state == .connecting ? "Connecting…" : "Start Pairing")
                         }
                         .frame(maxWidth: .infinity)
                     }
@@ -70,6 +87,13 @@ struct PairingView: View {
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.characters)
 
+                        if let message = tvManager.pairing.errorMessage {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                                .multilineTextAlignment(.center)
+                        }
+
                         Button {
                             submitCode()
                         } label: {
@@ -83,16 +107,16 @@ struct PairingView: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
 
                 case .verifying:
-                    ProgressView("Verifying...")
+                    ProgressView("Verifying…")
 
                 case .success:
                     Label("Paired Successfully!", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                         .font(.title3)
-                        .onAppear {
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                dismiss()
-                            }
+                        .task {
+                            try? await Task.sleep(for: .seconds(1.5))
+                            guard !Task.isCancelled else { return }
+                            dismiss()
                         }
 
                 case .failed:
@@ -101,8 +125,11 @@ struct PairingView: View {
                             .foregroundStyle(.red)
                             .font(.title3)
 
-                        if let msg = tvManager.pairing.errorMessage {
-                            Text(msg).font(.caption).foregroundStyle(.secondary)
+                        if let message = tvManager.pairing.errorMessage {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
                         }
 
                         Button("Try Again") {
@@ -114,48 +141,39 @@ struct PairingView: View {
                 }
             }
 
-            if let errorMessage {
-                Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-            }
-
             Spacer()
         }
         .padding()
-        .navigationTitle("Pair TV")
+        .navigationTitle(isRepair ? "Pair Again" : "Pair TV")
         .navigationBarTitleDisplayMode(.inline)
-        .onDisappear {
-            // Cancel any in-progress pairing when navigating away
-            if tvManager.pairing.state != .success {
-                tvManager.pairing.cancel()
-            }
+        .onAppear {
+            // A previous pairing can leave .success or .failed behind.
+            tvManager.pairing.cancel()
             pinCode = ""
-            errorMessage = nil
+        }
+        .onDisappear {
+            tvManager.pairing.cancel()
+            pinCode = ""
         }
     }
 
+    /// Uses the latest address on file, which may be newer than the one we were opened with.
+    private var pairingTarget: TVDevice {
+        tvManager.pairedDevices.first { $0.id == device.id } ?? device
+    }
+
+    // Both report failures through pairing.state and pairing.errorMessage.
     private func startPairing() {
-        errorMessage = nil
         Task {
-            do {
-                try await tvManager.startPairing(device: device)
-            } catch {
-                errorMessage = error.localizedDescription
-            }
+            try? await tvManager.startPairing(device: pairingTarget)
         }
     }
 
     private func submitCode() {
-        errorMessage = nil
         Task {
-            do {
-                try await tvManager.submitPairingCode(pinCode, device: device)
-                PhoneSessionManager.shared.sendPairedDevicesToWatch()
-                PhoneSessionManager.shared.sendCertificateToWatch()
-            } catch {
-                errorMessage = error.localizedDescription
+            guard (try? await tvManager.submitPairingCode(pinCode, device: pairingTarget)) != nil else { return }
+            if isRepair {
+                tvManager.retry()
             }
         }
     }
