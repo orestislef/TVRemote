@@ -6,6 +6,7 @@ enum RemoteCommand: String, Codable, Sendable {
     case power
     case volumeUp, volumeDown, mute
     case channelUp, channelDown
+    case playPause, stop, next, previous, rewind, fastForward
 
     var keyCode: Int32 {
         switch self {
@@ -20,8 +21,14 @@ enum RemoteCommand: String, Codable, Sendable {
         case .volumeUp:    return 24   // KEYCODE_VOLUME_UP
         case .volumeDown:  return 25   // KEYCODE_VOLUME_DOWN
         case .mute:        return 164  // KEYCODE_VOLUME_MUTE
-        case .channelUp:   return 166  // KEYCODE_CHANNEL_UP
-        case .channelDown: return 167  // KEYCODE_CHANNEL_DOWN
+        case .channelUp:    return 166  // KEYCODE_CHANNEL_UP
+        case .channelDown:  return 167  // KEYCODE_CHANNEL_DOWN
+        case .playPause:    return 85   // KEYCODE_MEDIA_PLAY_PAUSE
+        case .stop:         return 86   // KEYCODE_MEDIA_STOP
+        case .next:         return 87   // KEYCODE_MEDIA_NEXT
+        case .previous:     return 88   // KEYCODE_MEDIA_PREVIOUS
+        case .rewind:       return 89   // KEYCODE_MEDIA_REWIND
+        case .fastForward:  return 90   // KEYCODE_MEDIA_FAST_FORWARD
         }
     }
 }
