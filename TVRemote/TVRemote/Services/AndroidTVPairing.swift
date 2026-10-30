@@ -7,11 +7,9 @@ import os
 
 nonisolated(unsafe) private let log = Logger(subsystem: "gr.orestislef.TVRemote", category: "Pairing")
 
-// Import required types from other files
-// Note: These should be available in the same target
-
 // MARK: - Constants
 private let pairingTimeout: TimeInterval = 30.0
+private let openTimeout: TimeInterval = 10.0
 private let maxRetries = 2
 
 enum PairingError: Error, LocalizedError {
@@ -19,9 +17,12 @@ enum PairingError: Error, LocalizedError {
     case connectionFailed(String)
     case pairingRejected
     case invalidResponse
+    case invalidCode
     case timeout
     case serverCertNotAvailable
     case secretMismatch
+    case closedByTV
+    case cancelled
 
     var errorDescription: String? {
         switch self {
@@ -29,9 +30,37 @@ enum PairingError: Error, LocalizedError {
         case .connectionFailed(let msg): return "Connection failed: \(msg)"
         case .pairingRejected: return "TV rejected the pairing request"
         case .invalidResponse: return "Invalid response from TV"
+        case .invalidCode: return "Enter the code shown on your TV, using 0-9 and A-F."
         case .timeout: return "Connection timed out"
         case .serverCertNotAvailable: return "Could not get server certificate"
-        case .secretMismatch: return "Secret verification failed"
+        case .secretMismatch: return "That code doesn't match the TV. Check it and try again."
+        case .closedByTV: return "The TV closed pairing."
+        case .cancelled: return "Pairing cancelled"
+        }
+    }
+}
+
+/// Settles the socket open exactly once. The state handler, the timeout and
+/// closeSession can all get there, and resuming twice is a crash.
+private final class PairingOpenGate {
+    private var continuation: CheckedContinuation<Void, Error>?
+    var timeoutTask: Task<Void, Never>?
+
+    var isDone: Bool { continuation == nil }
+
+    init(_ continuation: CheckedContinuation<Void, Error>) {
+        self.continuation = continuation
+    }
+
+    func finish(throwing error: Error? = nil) {
+        guard let continuation else { return }
+        self.continuation = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        if let error {
+            continuation.resume(throwing: error)
+        } else {
+            continuation.resume()
         }
     }
 }
@@ -54,47 +83,48 @@ final class AndroidTVPairing {
     private var receiveBuffer = Data()
     private var serverCertificateData: Data?
     private var continuation: CheckedContinuation<Data, Error>?
+    @ObservationIgnored private var waitTimer: Task<Void, Never>?
+    @ObservationIgnored private var pendingOpen: PairingOpenGate?
+    /// Bumped by cancel and by every start, so a superseded flow stops instead of retrying.
+    @ObservationIgnored private var sessionID = 0
 
     func startPairing(device: TVDevice) async throws {
         // If a pairing session already reached the PIN stage and is alive, reuse it
         if state == .waitingForCode, connection?.state == .ready {
-            print("[PAIR] Existing pairing session still waiting for PIN — reusing it")
+            print("[PAIR] Existing pairing session still waiting for PIN, reusing it")
             return
         }
 
-        // Always close any stale TLS session first — the TV only allows ONE
+        sessionID += 1
+        let session = sessionID
+
+        // Always close any stale TLS session first: the TV only allows ONE
         // pairing session at a time and silently ignores requests otherwise.
         if connection != nil {
             print("[PAIR] Cleaning up stale pairing session")
-            continuation?.resume(throwing: PairingError.connectionFailed("Stale session"))
-            continuation = nil
-            disconnect()
+            closeSession(failing: PairingError.cancelled)
             try? await Task.sleep(for: .seconds(1))
+            guard session == sessionID else { throw PairingError.cancelled }
         }
 
         // Try pairing with retries for better reliability
         for attempt in 1...maxRetries {
             if attempt > 1 {
                 log.info("Pairing attempt \(attempt) of \(maxRetries)")
-                // Clean up any previous session before retry
-                if connection != nil {
-                    log.info("Cleaning up previous pairing connection before retry")
-                    continuation?.resume(throwing: PairingError.connectionFailed("Retry"))
-                    continuation = nil
-                    disconnect()
-                }
+                closeSession(failing: PairingError.cancelled)
                 // Small delay before retry
                 try? await Task.sleep(for: .seconds(1))
+                guard session == sessionID else { throw PairingError.cancelled }
             }
-            
+
             serverCertificateData = nil
-            
+
             state = .connecting
             errorMessage = nil
             log.info("=== PAIRING START (attempt \(attempt)/\(maxRetries)) === device='\(device.displayName)' host=\(device.host) pairingPort=\(device.pairingPort)")
             print("[PAIR] START attempt \(attempt) host=\(device.host) port=\(device.pairingPort)")
             log.info("Network interface check: attempting connection to \(device.host):\(device.pairingPort)")
-            
+
             do {
                 let identity = try CertificateManager.shared.getOrCreateIdentity()
                 log.info("TLS identity obtained successfully")
@@ -128,7 +158,7 @@ final class AndroidTVPairing {
                 let params = NWParameters(tls: tlsOptions)
                 // Enable peer-to-peer and local network for link-local addresses
                 params.includePeerToPeer = true
-                
+
                 let conn = NWConnection(
                     host: NWEndpoint.Host(device.host),
                     port: NWEndpoint.Port(rawValue: UInt16(device.pairingPort))!,
@@ -138,53 +168,9 @@ final class AndroidTVPairing {
                 self.connection = conn
                 log.info("Connecting to \(device.host):\(device.pairingPort) via TLS...")
 
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                    conn.stateUpdateHandler = { state in
-                        switch state {
-                        case .ready:
-                            log.info("TLS connection READY (pairing port)")
-                            print("[PAIR] TLS handshake READY")
-                            cont.resume()
-                        case .failed(let error):
-                            log.error("TLS connection FAILED: \(error.localizedDescription)")
-                            print("[PAIR] TLS connection FAILED: \(error.localizedDescription)")
-                            cont.resume(throwing: PairingError.connectionFailed(error.localizedDescription))
-                        case .cancelled:
-                            log.info("TLS connection CANCELLED")
-                            cont.resume(throwing: PairingError.connectionFailed("Cancelled"))
-                        case .waiting(let error):
-                            log.warning("TLS connection WAITING: \(error.localizedDescription)")
-                        case .preparing:
-                            log.debug("TLS connection preparing...")
-                        default:
-                            log.debug("TLS connection state: \(String(describing: state))")
-                        }
-                    }
-                    conn.start(queue: .main)
-                }
+                try await openSocket(conn)
 
-                conn.stateUpdateHandler = { [weak self] state in
-                    switch state {
-                    case .failed(let error):
-                        log.error("Pairing connection lost: \(error.localizedDescription)")
-                        Task { @MainActor [weak self] in
-                            self?.continuation?.resume(throwing: PairingError.connectionFailed(error.localizedDescription))
-                            self?.continuation = nil
-                            self?.state = .failed
-                            self?.errorMessage = "Connection lost"
-                        }
-                    case .cancelled:
-                        log.info("Pairing connection cancelled")
-                        Task { @MainActor [weak self] in
-                            self?.continuation?.resume(throwing: PairingError.connectionFailed("Cancelled"))
-                            self?.continuation = nil
-                        }
-                    default:
-                        break
-                    }
-                }
-
-                startReceiving()
+                startReceiving(on: conn)
 
                 // Step 1: Send PairingRequest
                 log.info("Step 1: Sending PairingRequest (serviceName='atvremote', clientName='TVRemote iOS')")
@@ -223,7 +209,7 @@ final class AndroidTVPairing {
                 let configMsg = buildPairingConfiguration()
                 send(configMsg)
 
-                // Step 6: Wait for configuration_ack — the TV shows the PIN after this
+                // Step 6: Wait for configuration_ack, the TV shows the PIN after this
                 log.info("Step 6: Waiting for configuration_ack...")
                 let configAckData = try await waitForMessage()
                 let configAckStatus = parsePairingStatus(configAckData)
@@ -232,14 +218,19 @@ final class AndroidTVPairing {
                     print("[PAIR] Configuration rejected by TV (status=\(configAckStatus))")
                     throw PairingError.pairingRejected
                 }
+                guard session == sessionID else { throw PairingError.cancelled }
 
                 state = .waitingForCode
                 print("[PAIR] === WAITING FOR PIN === TV should show a 6-digit code now")
                 return // Success, exit the retry loop
             } catch {
+                // Left the screen or started over. State already belongs to whoever did that.
+                guard session == sessionID else { throw PairingError.cancelled }
+
                 // If this was the last attempt, re-throw the error
                 if attempt == maxRetries {
                     log.error("All pairing attempts failed. Last error: \(error)")
+                    closeSession(failing: PairingError.cancelled)
                     state = .failed
                     errorMessage = error.localizedDescription
                     throw error
@@ -252,68 +243,156 @@ final class AndroidTVPairing {
     }
 
     func submitCode(_ code: String) async throws {
-        state = .verifying
+        guard state == .waitingForCode, connection != nil else {
+            throw PairingError.connectionFailed("Pairing session ended")
+        }
+        let session = sessionID
         log.info("=== SUBMITTING CODE === code='\(code)'")
 
-        // Validate hex code
+        // Bad input never reaches the TV, so the session is still good for another go.
         let cleanCode = code.replacingOccurrences(of: " ", with: "").uppercased()
         let validHex = cleanCode.allSatisfy { "0123456789ABCDEF".contains($0) }
         guard validHex && cleanCode.count >= 2 && cleanCode.count % 2 == 0 else {
-            log.error("Invalid hex code: '\(code)' — must be hex characters (0-9, A-F), even length, at least 2 chars")
-            throw PairingError.invalidResponse
+            log.error("Invalid hex code: '\(code)', must be hex characters (0-9, A-F), even length, at least 2 chars")
+            errorMessage = PairingError.invalidCode.errorDescription
+            throw PairingError.invalidCode
         }
 
-        guard let serverCertData = serverCertificateData else {
-            log.error("No server certificate data available")
-            throw PairingError.serverCertNotAvailable
-        }
-        guard let clientCertData = CertificateManager.shared.getClientCertificateData() else {
-            log.error("No client certificate data available")
-            throw PairingError.noIdentity
-        }
+        state = .verifying
+        errorMessage = nil
 
-        log.info("Computing pairing secret: clientCert=\(clientCertData.count)B, serverCert=\(serverCertData.count)B, code='\(cleanCode)'")
-        let secret = try computePairingSecret(
-            clientCert: clientCertData,
-            serverCert: serverCertData,
-            code: cleanCode
-        )
-        log.info("Secret computed: \(secret.map { String(format: "%02X", $0) }.joined())")
+        do {
+            guard let serverCertData = serverCertificateData else {
+                log.error("No server certificate data available")
+                throw PairingError.serverCertNotAvailable
+            }
+            guard let clientCertData = CertificateManager.shared.getClientCertificateData() else {
+                log.error("No client certificate data available")
+                throw PairingError.noIdentity
+            }
 
-        // Step 5: Send PairingSecret
-        log.info("Step 5: Sending PairingSecret")
-        let secretMsg = buildPairingSecret(secret: secret)
-        send(secretMsg)
+            log.info("Computing pairing secret: clientCert=\(clientCertData.count)B, serverCert=\(serverCertData.count)B, code='\(cleanCode)'")
+            let secret = try computePairingSecret(
+                clientCert: clientCertData,
+                serverCert: serverCertData,
+                code: cleanCode
+            )
+            log.info("Secret computed: \(secret.map { String(format: "%02X", $0) }.joined())")
 
-        // Step 6: Wait for PairingSecretAck
-        log.info("Step 6: Waiting for PairingSecretAck...")
-                let ackData = try await waitForMessage()
-                let ackStatus = parsePairingStatus(ackData)
-                print("[PAIR] PairingSecretAck status=\(ackStatus) raw=\(ackData.map { String(format: "%02X", $0) }.joined())")
+            // Step 5: Send PairingSecret
+            log.info("Step 5: Sending PairingSecret")
+            let secretMsg = buildPairingSecret(secret: secret)
+            send(secretMsg)
 
-        guard ackStatus == 200 else {
-            log.error("TV rejected the pairing secret (wrong code?)")
-            throw PairingError.pairingRejected
+            // Step 6: Wait for PairingSecretAck
+            log.info("Step 6: Waiting for PairingSecretAck...")
+            let ackData = try await waitForMessage()
+            let ackStatus = parsePairingStatus(ackData)
+            print("[PAIR] PairingSecretAck status=\(ackStatus) raw=\(ackData.map { String(format: "%02X", $0) }.joined())")
+            guard session == sessionID else { throw PairingError.cancelled }
+
+            guard ackStatus == 200 else {
+                log.error("TV rejected the pairing secret (wrong code?)")
+                throw PairingError.pairingRejected
+            }
+        } catch PairingError.secretMismatch {
+            // The check byte caught a mistyped code before anything was sent.
+            state = .waitingForCode
+            errorMessage = PairingError.secretMismatch.errorDescription
+            throw PairingError.secretMismatch
+        } catch {
+            guard session == sessionID else { throw PairingError.cancelled }
+            closeSession(failing: PairingError.cancelled)
+            state = .failed
+            errorMessage = error.localizedDescription
+            throw error
         }
 
         state = .success
+        errorMessage = nil
         log.info("=== PAIRING SUCCESS ===")
-        disconnect()
+        closeSession(failing: PairingError.cancelled)
     }
-    
+
     func cancel() {
-        log.info("Pairing cancelled by user")
-        continuation?.resume(throwing: PairingError.connectionFailed("Cancelled"))
-        continuation = nil
-        disconnect()
+        log.info("Pairing cancelled")
+        sessionID += 1
+        closeSession(failing: PairingError.cancelled)
+        serverCertificateData = nil
+        errorMessage = nil
         state = .idle
     }
-    
-    private func disconnect() {
-        log.info("Disconnecting pairing connection")
-        connection?.cancel()
+
+    /// Ends the socket and fails anything waiting on it. The handler goes first so
+    /// the .cancelled this causes can't be mistaken for the next attempt's socket.
+    private func closeSession(failing error: Error) {
+        log.info("Closing pairing connection")
+        let conn = connection
         connection = nil
+        conn?.stateUpdateHandler = nil
+        conn?.cancel()
         receiveBuffer = Data()
+        pendingOpen?.finish(throwing: error)
+        pendingOpen = nil
+        finishWait(.failure(error))
+    }
+
+    /// Waits for .ready, failing fast on .waiting since a TV that's off or at the
+    /// wrong address would otherwise spin there forever.
+    private func openSocket(_ conn: NWConnection) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let gate = PairingOpenGate(cont)
+            pendingOpen = gate
+
+            conn.stateUpdateHandler = { [weak self] state in
+                Task { @MainActor [weak self] in
+                    guard let self, self.connection === conn else { return }
+                    switch state {
+                    case .ready:
+                        log.info("TLS connection READY (pairing port)")
+                        print("[PAIR] TLS handshake READY")
+                        gate.finish()
+                    case .waiting(let error), .failed(let error):
+                        log.error("TLS connection ended: \(error.localizedDescription)")
+                        print("[PAIR] TLS connection ended: \(error.localizedDescription)")
+                        self.socketEnded(conn, gate: gate, error: .connectionFailed(error.localizedDescription))
+                    case .cancelled:
+                        log.info("TLS connection CANCELLED")
+                        self.socketEnded(conn, gate: gate, error: .connectionFailed("Cancelled"))
+                    default:
+                        break
+                    }
+                }
+            }
+
+            gate.timeoutTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(openTimeout))
+                guard !Task.isCancelled else { return }
+                log.error("Pairing connection timeout (\(openTimeout)s)")
+                gate.finish(throwing: PairingError.timeout)
+            }
+            conn.start(queue: .main)
+        }
+    }
+
+    private func socketEnded(_ conn: NWConnection, gate: PairingOpenGate, error: PairingError) {
+        if gate.isDone {
+            sessionEnded(conn, error: error)
+        } else {
+            gate.finish(throwing: error)
+        }
+    }
+
+    /// The pairing socket died on its own. Stale callbacks from an older socket do nothing.
+    private func sessionEnded(_ conn: NWConnection, error: PairingError) {
+        guard connection === conn else { return }
+        log.error("Pairing connection lost: \(error.localizedDescription)")
+        closeSession(failing: error)
+        // During connecting and verifying, the failed wait above reports it instead.
+        if state == .waitingForCode {
+            state = .failed
+            errorMessage = error.localizedDescription
+        }
     }
 
     // MARK: - Secret Computation
@@ -553,27 +632,37 @@ final class AndroidTVPairing {
         })
     }
 
-    private func startReceiving() {
-        connection?.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            if let data {
+    private func startReceiving(on conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, isComplete, error in
+            guard let self, self.connection === conn else { return }
+            if let data, !data.isEmpty {
                 log.debug("Received \(data.count) bytes: \(data.prefix(32).map { String(format: "%02X", $0) }.joined())...")
                 self.receiveBuffer.append(data)
-                if let message = MessageFraming.extractMessage(from: &self.receiveBuffer) {
+                // With nobody waiting, leave it buffered for the next waitForMessage.
+                if self.continuation != nil, let message = MessageFraming.extractMessage(from: &self.receiveBuffer) {
                     log.info("Complete message extracted: \(message.count) bytes")
-                    self.continuation?.resume(returning: message)
-                    self.continuation = nil
+                    self.finishWait(.success(message))
                 }
             }
             if let error {
                 log.error("Receive error: \(error.localizedDescription)")
-            }
-            if isComplete {
+                self.sessionEnded(conn, error: .connectionFailed(error.localizedDescription))
+            } else if isComplete {
                 log.info("Connection receive completed (EOF)")
-            } else if error == nil {
-                self.startReceiving()
+                self.sessionEnded(conn, error: .closedByTV)
+            } else {
+                self.startReceiving(on: conn)
             }
         }
+    }
+
+    /// Resumes the current wait, if any, and stops its timer so it can't fire on a later wait.
+    private func finishWait(_ result: Result<Data, Error>) {
+        waitTimer?.cancel()
+        waitTimer = nil
+        guard let continuation else { return }
+        self.continuation = nil
+        continuation.resume(with: result)
     }
 
     private func waitForMessage() async throws -> Data {
@@ -581,24 +670,20 @@ final class AndroidTVPairing {
             log.error("waitForMessage called but no connection")
             throw PairingError.connectionFailed("Not connected")
         }
-    
+
         return try await withCheckedThrowingContinuation { cont in
-            self.continuation = cont
-    
             if let message = MessageFraming.extractMessage(from: &self.receiveBuffer) {
                 log.info("Message already buffered: \(message.count) bytes")
-                self.continuation = nil
                 cont.resume(returning: message)
                 return
             }
-    
-            Task { [weak self] in
-                try await Task.sleep(for: .seconds(pairingTimeout))
-                if let self, self.continuation != nil {
-                    log.error("Timeout waiting for pairing message (\(pairingTimeout)s)")
-                    self.continuation?.resume(throwing: PairingError.timeout)
-                    self.continuation = nil
-                }
+
+            self.continuation = cont
+            self.waitTimer = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(pairingTimeout))
+                guard !Task.isCancelled, let self else { return }
+                log.error("Timeout waiting for pairing message (\(pairingTimeout)s)")
+                self.finishWait(.failure(PairingError.timeout))
             }
         }
     }
