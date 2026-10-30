@@ -3,22 +3,27 @@ import SwiftUI
 struct ContentView: View {
     @Environment(TVManager.self) private var tvManager
     @State private var watchSession = PhoneSessionManager.shared
+    @State private var selectedTab = AppTab.myTVs
+
+    private enum AppTab: Hashable {
+        case myTVs, discover, watch
+    }
 
     var body: some View {
-        TabView {
-            Tab("My TVs", systemImage: "tv.fill") {
+        TabView(selection: $selectedTab) {
+            Tab("My TVs", systemImage: "tv.fill", value: AppTab.myTVs) {
                 NavigationStack {
-                    PairedTVsView()
+                    PairedTVsView(onFindTVs: { selectedTab = .discover })
                 }
             }
 
-            Tab("Discover", systemImage: "wifi") {
+            Tab("Discover", systemImage: "wifi", value: AppTab.discover) {
                 NavigationStack {
                     DiscoveryView()
                 }
             }
 
-            Tab("Watch", systemImage: "applewatch") {
+            Tab("Watch", systemImage: "applewatch", value: AppTab.watch) {
                 NavigationStack {
                     WatchStatusView()
                 }
@@ -92,10 +97,11 @@ struct WatchStatusView: View {
                             .foregroundStyle(.green)
                     }
 
-                    if session.isReachable {
-                        Button("Sync TVs to Watch") {
-                            session.sendPairedDevicesToWatch()
-                        }
+                    // applicationContext is delivered later, so this works unreachable too.
+                    // Forced, because being out of step with an unchanged list is why
+                    // anyone presses this.
+                    Button("Sync TVs to Watch") {
+                        session.sendPairedDevicesToWatch(force: true)
                     }
                 }
             }
@@ -127,6 +133,6 @@ struct WatchStatusView: View {
     private var statusSubtitle: String {
         if !session.isPaired { return "Pair an Apple Watch to use the remote from your wrist." }
         if !session.isWatchAppInstalled { return "Tap below to install the TVRemote Watch app." }
-        return session.isReachable ? "Connected and ready to control your TV." : "Open the Watch app to start controlling."
+        return session.isReachable ? "Watch connected to iPhone" : "Open the Watch app to start controlling."
     }
 }
