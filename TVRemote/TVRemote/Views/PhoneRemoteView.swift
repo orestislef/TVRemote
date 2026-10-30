@@ -1,262 +1,434 @@
+import Foundation
 import SwiftUI
+import UIKit
 
-/// Full remote control screen for the phone — one centered page:
-/// status bar, D-Pad, media transport, volume (live TV state), and an
-/// expandable "more" section. Centered symmetric layout that fits all
-/// phone widths.
+private let smallestPortraitDiameter: CGFloat = 180
+
+/// iOS 26 pops on a rightward pan anywhere in the content, which is too easy to do
+/// by feel on a remote in a dark room. The screen-edge swipe still goes back.
+private struct ContentPopGuard: UIViewControllerRepresentable {
+    final class Controller: UIViewController {
+        private weak var guarded: UINavigationController?
+
+        override func viewDidLoad() {
+            super.viewDidLoad()
+            view.isUserInteractionEnabled = false
+        }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            guarded = navigationController
+            guarded?.interactiveContentPopGestureRecognizer?.isEnabled = false
+        }
+
+        override func viewWillDisappear(_ animated: Bool) {
+            super.viewWillDisappear(animated)
+            guarded?.interactiveContentPopGestureRecognizer?.isEnabled = true
+        }
+    }
+
+    func makeUIViewController(context: Context) -> Controller {
+        Controller()
+    }
+
+    func updateUIViewController(_ controller: Controller, context: Context) {}
+}
+
+/// The remote: a volume knob with a D-pad inside, and everything else kept quiet.
+/// Fits one screen without scrolling from SE to Pro Max, in both orientations.
 struct PhoneRemoteView: View {
     let device: TVDevice
-    @Environment(TVManager.self) private var tvManager
-    @State private var showMore = false
 
-    private var connection: AndroidTVConnection {
-        tvManager.remoteConnection
+    private enum SlotTransient: Equatable {
+        case connected
+        case hint(String)
+    }
+
+    @Environment(TVManager.self) private var tvManager
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @AppStorage("hapticsEnabled") private var hapticsEnabled = true
+
+    @State private var debouncer = PhaseDebouncer()
+    @State private var transient: SlotTransient?
+    /// Restarts the timer even when the same hint is shown twice.
+    @State private var transientRequest = 0
+    @State private var pulse = HapticPulse()
+    @State private var limitHapticPlayed = false
+    @State private var showRepair = false
+
+    /// Follows address changes the manager picked up after this view was pushed.
+    private var currentDevice: TVDevice {
+        tvManager.pairedDevices.first { $0.id == device.id } ?? device
+    }
+
+    private var isActiveDevice: Bool {
+        tvManager.activeDevice?.id == device.id
+    }
+
+    private var devicePhase: ConnectionPhase {
+        tvManager.phase(for: device)
     }
 
     private var isConnected: Bool {
-        connection.isConnected
+        isActiveDevice && devicePhase.isConnected
+    }
+
+    /// Another TV's volume and app must never show under this TV's name.
+    private var status: TVStatus {
+        isActiveDevice ? tvManager.status : TVStatus()
+    }
+
+    /// Nil during the first quiet period, when the slot stays blank.
+    private var displayPhase: ConnectionPhase? {
+        devicePhase.isConnected ? devicePhase : debouncer.shown
+    }
+
+    private var isTVOff: Bool {
+        isConnected && status.isTVOff
+    }
+
+    private var isLive: Bool {
+        displayPhase?.isConnected == true && !isTVOff
+    }
+
+    private var failure: ConnectionFailure? {
+        displayPhase?.failure
     }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 20) {
-                if isConnected {
-                    statusBar
-                    dPad
-                    mediaControls
-                    volumeControls
-                    moreControls
-
-                    Button {
-                        tvManager.disconnect()
-                    } label: {
-                        Label("Disconnect", systemImage: "xmark.circle")
-                            .foregroundStyle(.red)
-                    }
-                    .buttonStyle(.bordered)
-                    .padding(.bottom, 8)
-                } else {
-                    VStack(spacing: 16) {
-                        Image(systemName: "tv.slash")
-                            .font(.system(size: 40))
-                            .foregroundStyle(.secondary)
-                        Text("Not connected")
-                            .foregroundStyle(.secondary)
-                        Button {
-                            connectToDevice()
-                        } label: {
-                            Text("Connect")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                    .frame(minHeight: 380)
+        layout
+            .background { RemoteTheme.background.ignoresSafeArea() }
+            .background { ContentPopGuard().accessibilityHidden(true) }
+            .environment(\.colorScheme, .dark)
+            .navigationTitle(currentDevice.displayName)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar(.hidden, for: .tabBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .toolbarBackground(RemoteTheme.background, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbar { toolbarItems }
+            .navigationDestination(isPresented: $showRepair) {
+                PairingView(device: currentDevice, isRepair: true)
+            }
+            .sensoryFeedback(trigger: pulse) { _, new in
+                hapticsEnabled ? new.haptic.feedback : nil
+            }
+            .task(id: transientRequest) {
+                guard transient != nil else { return }
+                do {
+                    try await Task.sleep(for: .milliseconds(1500))
+                } catch {
+                    return
+                }
+                transient = nil
+            }
+            .onAppear {
+                debouncer.update(to: devicePhase)
+                if !isConnected {
+                    tvManager.connect(to: currentDevice)
                 }
             }
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 24)
-            .padding(.top, 8)
-        }
-        .navigationTitle(device.displayName)
-        .navigationBarTitleDisplayMode(.inline)
-        .onAppear {
-            if !isConnected {
-                connectToDevice()
+            .onDisappear {
+                debouncer.cancel()
+            }
+            .onChange(of: devicePhase) { _, phase in
+                debouncer.update(to: phase)
+            }
+            .onChange(of: displayPhase) { old, new in
+                displayPhaseChanged(from: old, to: new)
+            }
+            .onChange(of: isTVOff) { _, off in
+                // Losing the session also clears this, and says nothing about the TV.
+                if isConnected { announce(off ? "TV is off" : "TV is on") }
+            }
+            .onChange(of: tvManager.commandRejectionCount) {
+                pulse.play(.error)
+            }
+    }
+
+    // MARK: - Layout
+
+    private var layout: some View {
+        GeometryReader { proxy in
+            let width = proxy.size.width
+            let height = proxy.size.height
+
+            if dynamicTypeSize.isAccessibilitySize || (width <= height && portraitFit(height: height) < smallestPortraitDiameter) {
+                scrollingLayout(width: width)
+            } else if width > height {
+                landscapeLayout(width: width, height: height)
+            } else {
+                portraitLayout(width: width, height: height)
             }
         }
     }
 
-    // MARK: - Status (TV on/off, current app, mute)
+    /// The largest Halo the portrait stack can hold: 1.04D, fixed rows 36 + 52 + 56 + 52,
+    /// four gaps of at least 12, 8 + 8 padding.
+    private func portraitFit(height: CGFloat) -> CGFloat {
+        (height - 260) / 1.04
+    }
 
-    private var statusBar: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 8, height: 8)
-                Text("TV On")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .fixedSize()
-
-            Divider()
-                .frame(height: 14)
-
-            Image(systemName: "app.fill")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text(connection.currentApp.isEmpty ? "Home" : connection.currentApp)
-                .font(.caption)
-                .lineLimit(1)
-                .layoutPriority(1)
-                .minimumScaleFactor(0.75)
-
-            if connection.volumeMuted {
-                Spacer(minLength: 6)
-                Image(systemName: "speaker.slash.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                Text("Muted")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .fixedSize()
-            }
+    // Portrait SE: H 603, content 335, D 313 (1.04D = 325.5). Fixed rows 36 + 52 + 56 + 52,
+    // four gaps of at least 12, 8 + 8 padding: 585.5, leaving the spacers 17.5 to share.
+    // Display Zoom on an SE is shorter than the 240 floor allows, so the fit wins there.
+    private func portraitLayout(width: CGFloat, height: CGFloat) -> some View {
+        let contentWidth = min(width - 40, 400)
+        let diameter = min(portraitFit(height: height), min(max(min(contentWidth, height * 0.52), 240), 360))
+        return VStack(spacing: 0) {
+            slot
+                .accessibilitySortPriority(3)
+            Spacer(minLength: 12)
+            halo(diameter: diameter)
+                .accessibilitySortPriority(2)
+            Spacer(minLength: 12)
+            utilityRow
+            Spacer(minLength: 12)
+            rocker
+            Spacer(minLength: 12)
+            transportRow
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(width: contentWidth)
         .padding(.vertical, 8)
-        .padding(.horizontal, 12)
-        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
     }
 
-    // MARK: - D-Pad
+    // Landscape SE: W 667, H about 331, D = min(315, 280) = 280 (1.04D = 291.2), so the
+    // Halo clears the height by 40. Column 323 wide, its stack 196 + 36 gaps = 232 tall.
+    private func landscapeLayout(width: CGFloat, height: CGFloat) -> some View {
+        let diameter = min(height - 16, width * 0.42, height / 1.04)
+        let columnWidth = min(width - diameter - 64, 440)
+        return HStack(spacing: 0) {
+            VStack(spacing: 12) {
+                slot
+                    .accessibilitySortPriority(3)
+                rocker
+                utilityRow
+                transportRow
+            }
+            .frame(width: columnWidth)
+            .frame(maxWidth: .infinity)
 
-    private var dPad: some View {
-        VStack(spacing: 12) {
-            padButton(.up, icon: "chevron.up", width: 80, height: 56)
+            halo(diameter: diameter)
+                .accessibilitySortPriority(2)
+                .padding(.trailing, 16)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
+    }
 
-            HStack(spacing: 12) {
-                padButton(.left, icon: "chevron.left", width: 60, height: 60)
-                Button { tvManager.sendCommand(.ok) } label: {
-                    Text("OK")
-                        .font(.headline.bold())
-                        .foregroundStyle(.white)
-                        .frame(width: 72, height: 72)
-                        .background(Circle().fill(Color.blue))
+    // The one layout that scrolls: accessibility sizes, and windows too short for the
+    // portrait stack. The disc can't hold large failure text, so the copy takes the
+    // Halo's place here.
+    private func scrollingLayout(width: CGFloat) -> some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                slot
+                    .accessibilitySortPriority(3)
+                Group {
+                    if let failure {
+                        failedPanel(failure, fitsDisc: false)
+                    } else {
+                        halo(diameter: min(240, width - 40))
+                    }
                 }
-                .buttonStyle(.plain)
-                padButton(.right, icon: "chevron.right", width: 60, height: 60)
+                .accessibilitySortPriority(2)
+                utilityRow
+                rocker
+                transportRow
             }
-
-            padButton(.down, icon: "chevron.down", width: 80, height: 56)
+            .frame(width: min(width - 40, 400))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .accessibilityElement(children: .contain)
+            .environment(\.pressesFireOnRelease, true)
         }
     }
 
-    // MARK: - Media
+    // MARK: - Pieces
 
-    private var mediaControls: some View {
-        VStack(spacing: 10) {
-            Label("Media", systemImage: "play.rectangle.fill")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            // Total ≈ 4×56 + 66 + spacing = 356 — fits the narrowest
-            // iPhone (375pt) with content area 327 if padded 24 each side.
-            // Use spacing 6 to be safe on SE-sized screens too.
-            HStack(spacing: 6) {
-                transportButton(.previous, icon: "backward.end.fill")
-                transportButton(.rewind, icon: "backward.fill")
-                transportButton(.playPause, icon: "playpause.fill", tint: .green, prominent: true)
-                transportButton(.fastForward, icon: "forward.fill")
-                transportButton(.next, icon: "forward.end.fill")
+    private var slotContent: StatusSlotContent {
+        guard let displayPhase else { return .empty }
+        switch displayPhase {
+        case .idle:
+            return .notConnected
+        case .connecting:
+            return .connecting(currentDevice.displayName)
+        case .reconnecting:
+            return .reconnecting
+        case .failed:
+            return .empty
+        case .connected:
+            if isTVOff { return .tvOff }
+            switch transient {
+            case .connected: return .connected
+            case .hint(let text): return .hint(text)
+            case nil: return .appChip(status.appName ?? "Home")
             }
         }
     }
 
-    // MARK: - Volume (live TV-reported level)
+    private var slot: some View {
+        StatusSlot(content: slotContent) {
+            tvManager.connect(to: currentDevice)
+        }
+    }
 
-    private var volumeControls: some View {
-        VStack(spacing: 10) {
-            HStack {
-                Label("Volume", systemImage: "speaker.fill")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text(connection.volumeMuted ? "Muted" : "\(connection.volumeLevel) / \(connection.volumeMax)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(connection.volumeMuted ? .orange : .secondary)
+    private func halo(diameter: CGFloat) -> some View {
+        HaloPad(
+            diameter: diameter,
+            status: status,
+            isReconnecting: displayPhase == .reconnecting,
+            isLive: isLive,
+            isTVOff: isTVOff,
+            showsDiscOverlay: failure != nil,
+            send: sender
+        ) {
+            if let failure {
+                failedPanel(failure, fitsDisc: true)
             }
+        }
+    }
 
-            HStack(spacing: 12) {
-                transportButton(.volumeDown, icon: "speaker.minus.fill", prominent: true)
-                transportButton(.mute, icon: "speaker.slash.fill", tint: connection.volumeMuted ? .orange : .secondary)
-                transportButton(.volumeUp, icon: "speaker.plus.fill", prominent: true)
-            }
-
-            // Progress bar showing the live TV-reported level
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule()
-                        .fill(.quaternary)
-                    Capsule()
-                        .fill(volumeMuted ? AnyShapeStyle(.orange) : AnyShapeStyle(.tint))
-                        .frame(width: volumeWidth(in: geo.size.width))
+    private func failedPanel(_ failure: ConnectionFailure, fitsDisc: Bool) -> some View {
+        FailedPanel(
+            failure: failure,
+            fitsDisc: fitsDisc,
+            onRetry: { tvManager.retry() },
+            onMyTVs: { dismiss() },
+            onPairAgain: { showRepair = true },
+            onOpenSettings: {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
                 }
             }
-            .frame(height: 6)
-            .animation(.snappy, value: connection.volumeLevel)
-            .animation(.snappy, value: connection.volumeMuted)
-        }
+        )
     }
 
-    private var volumeMuted: Bool { connection.volumeMuted }
-
-    private func volumeWidth(in width: CGFloat) -> CGFloat {
-        guard connection.volumeMax > 0 else { return 0 }
-        let fraction = CGFloat(connection.volumeLevel) / CGFloat(connection.volumeMax)
-        return max(6, width * fraction)
+    private var utilityRow: some View {
+        UtilityRow(send: sender)
+            .remoteControls(isLive: isLive)
     }
 
-    // MARK: - More
+    private var rocker: some View {
+        VolumeRocker(isMuted: status.isMuted, send: sender)
+            .remoteControls(isLive: isLive)
+    }
 
-    private var moreControls: some View {
-        VStack(spacing: 10) {
-            Button {
-                withAnimation { showMore.toggle() }
+    private var transportRow: some View {
+        TransportRow(send: sender)
+            .remoteControls(isLive: isLive)
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarItems: some ToolbarContent {
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            PowerButton(
+                isTVOff: isTVOff,
+                onFire: { send(.power, isRepeat: false) },
+                onTapHint: { showTransient(.hint("Hold to turn off")) }
+            )
+            .disabled(displayPhase?.isConnected != true)
+
+            Menu {
+                Button {
+                    dismiss()
+                } label: {
+                    Label("Switch TV", systemImage: "tv")
+                }
+                Toggle(isOn: $hapticsEnabled) {
+                    Label("Haptics", systemImage: "iphone.radiowaves.left.and.right")
+                }
+                Divider()
+                Button(role: .destructive) {
+                    tvManager.disconnect()
+                } label: {
+                    Label("Disconnect", systemImage: "xmark.circle")
+                }
+                .disabled(devicePhase == .idle)
             } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: showMore ? "chevron.up" : "ellipsis.circle")
-                    Text(showMore ? "Less" : "More")
-                }
-                .font(.caption)
-            }
-            .buttonStyle(.bordered)
-
-            if showMore {
-                VStack(spacing: 12) {
-                    HStack(spacing: 12) {
-                        transportButton(.channelDown, icon: "chevron.down.circle")
-                        transportButton(.channelUp, icon: "chevron.up.circle")
-                    }
-
-                    HStack(spacing: 12) {
-                        padButton(.back, icon: "arrow.uturn.backward", width: 60, height: 46)
-                        padButton(.home, icon: "house.fill", width: 60, height: 46)
-                        padButton(.power, icon: "power", width: 60, height: 46, tint: .red)
-                    }
-                }
+                Label("More", systemImage: "ellipsis")
             }
         }
     }
 
-    // MARK: - Helpers
+    // MARK: - Actions
 
-    private func padButton(_ cmd: RemoteCommand, icon: String, width: CGFloat, height: CGFloat, tint: Color = .blue) -> some View {
-        Button { tvManager.sendCommand(cmd) } label: {
-            Image(systemName: icon)
-                .font(.title2.bold())
-                .foregroundStyle(tint)
-                .frame(width: width, height: height)
-                .background(Capsule().fill(Color(.systemGray5)))
-        }
-        .buttonStyle(.plain)
+    private var sender: (RemoteCommand, _ isRepeat: Bool) -> Void {
+        { command, isRepeat in send(command, isRepeat: isRepeat) }
     }
 
-    private func transportButton(_ cmd: RemoteCommand, icon: String, tint: Color = .blue, prominent: Bool = false) -> some View {
-        Button { tvManager.sendCommand(cmd) } label: {
-            Image(systemName: icon)
-                .font(.title3.bold())
-                .foregroundStyle(prominent ? .white : Color(tint))
-                .frame(width: prominent ? 66 : 56, height: 50)
-                .background(Capsule().fill(prominent ? tint : Color(.systemGray5)))
-        }
-        .buttonStyle(.plain)
+    private func showTransient(_ value: SlotTransient) {
+        transient = value
+        transientRequest += 1
     }
 
-    private func connectToDevice() {
-        Task {
-            try? await tvManager.connectToDevice(device)
+    private func send(_ command: RemoteCommand, isRepeat: Bool) {
+        if let haptic = haptic(for: command, isRepeat: isRepeat) {
+            pulse.play(haptic)
         }
+        tvManager.sendCommand(command)
+    }
+
+    private func haptic(for command: RemoteCommand, isRepeat: Bool) -> RemoteHaptic? {
+        switch command {
+        case .volumeUp, .volumeDown:
+            if !isRepeat { limitHapticPlayed = false }
+            guard isAtVolumeLimit(for: command) else {
+                limitHapticPlayed = false
+                return .selection
+            }
+            // One thud at the limit, not one per repeat.
+            defer { limitHapticPlayed = true }
+            return limitHapticPlayed ? nil : .rigid
+        case .power:
+            return .heavy
+        case .ok, .playPause, .mute:
+            return .medium
+        default:
+            return isRepeat ? .selection : .soft
+        }
+    }
+
+    private func isAtVolumeLimit(for command: RemoteCommand) -> Bool {
+        guard let level = status.volumeLevel, let max = status.volumeMax, max > 0 else { return false }
+        return command == .volumeUp ? level >= max : level <= 0
+    }
+
+    private func displayPhaseChanged(from old: ConnectionPhase?, to new: ConnectionPhase?) {
+        guard let new else { return }
+        switch new {
+        case .connected:
+            // Only after a wait the user actually saw. A silent reconnect stays silent.
+            if let old, !old.isConnected, old != .idle {
+                pulse.play(.success)
+                showTransient(.connected)
+                announce("Connected")
+            }
+        case .connecting:
+            announce("Connecting to \(currentDevice.displayName)")
+        case .reconnecting:
+            pulse.play(.warning)
+            announce("Reconnecting")
+        case .failed(let failure):
+            pulse.play(.error)
+            announce("\(failure.title). \(failure.message)")
+        case .idle:
+            announce("Not connected")
+        }
+    }
+
+    private func announce(_ text: String) {
+        UIAccessibility.post(notification: .announcement, argument: text)
+    }
+}
+
+private extension View {
+    func remoteControls(isLive: Bool) -> some View {
+        opacity(isLive ? 1 : RemoteTheme.dimmedOpacity)
+            .disabled(!isLive)
+            .animation(.easeInOut(duration: 0.2), value: isLive)
     }
 }
