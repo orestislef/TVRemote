@@ -76,8 +76,11 @@ struct ProtobufDecoder {
     }
 
     mutating func readLengthDelimited() -> Data {
-        let length = Int(readVarint())
-        guard offset + length <= data.count else { return Data() }
+        let length = Int(clamping: readVarint())
+        guard length <= data.count - offset else {
+            offset = data.count
+            return Data()
+        }
         let start = data.startIndex + offset
         let result = data[start..<start + length]
         offset += length
@@ -92,11 +95,15 @@ struct ProtobufDecoder {
     mutating func skip(wireType: Int) {
         switch wireType {
         case 0: _ = readVarint()
-        case 1: offset += 8
-        case 2: let len = Int(readVarint()); offset += len
-        case 5: offset += 4
+        case 1: advance(by: 8)
+        case 2: advance(by: Int(clamping: readVarint()))
+        case 5: advance(by: 4)
         default: break
         }
+    }
+
+    private mutating func advance(by count: Int) {
+        offset = count <= data.count - offset ? offset + count : data.count
     }
 }
 
@@ -110,15 +117,53 @@ enum MessageFraming {
         return framed
     }
 
+    /// Largest frame we accept. Real TV messages are far smaller, so anything
+    /// bigger means the stream lost sync.
+    static let maxFrameLength: UInt64 = 1 << 20
+
+    enum Frame {
+        case message(Data)
+        case incomplete
+        /// The stream lost sync. The buffer has been cleared, and what follows on
+        /// the socket starts at a random offset, so the session can't be trusted.
+        case corrupt
+    }
+
     static func extractMessage(from buffer: inout Data) -> Data? {
-        guard !buffer.isEmpty else { return nil }
-        var decoder = ProtobufDecoder(data: buffer)
-        let length = Int(decoder.readVarint())
-        let headerSize = decoder.offset
-        guard buffer.count >= headerSize + length else { return nil }
+        if case .message(let message) = nextFrame(from: &buffer) { return message }
+        return nil
+    }
+
+    static func nextFrame(from buffer: inout Data) -> Frame {
+        // The length prefix may arrive split across TCP reads, so read it by
+        // hand and wait for the rest instead of trusting a partial varint.
+        var length: UInt64 = 0
+        var shift: UInt64 = 0
+        var headerSize = 0
+        var headerComplete = false
+        for byte in buffer {
+            headerSize += 1
+            length |= UInt64(byte & 0x7F) << shift
+            if byte & 0x80 == 0 {
+                headerComplete = true
+                break
+            }
+            shift += 7
+            if shift >= 64 {
+                buffer.removeAll()
+                return .corrupt
+            }
+        }
+        guard headerComplete else { return .incomplete }
+        guard length <= maxFrameLength else {
+            buffer.removeAll()
+            return .corrupt
+        }
+        let frameLength = Int(length)
+        guard buffer.count >= headerSize + frameLength else { return .incomplete }
         let start = buffer.startIndex + headerSize
-        let message = Data(buffer[start..<start + length])
-        buffer.removeFirst(headerSize + length)
-        return message
+        let message = Data(buffer[start..<start + frameLength])
+        buffer.removeFirst(headerSize + frameLength)
+        return .message(message)
     }
 }
