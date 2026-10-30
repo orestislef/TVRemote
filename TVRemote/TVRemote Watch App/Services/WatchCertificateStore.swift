@@ -10,8 +10,14 @@ final class WatchCertificateStore {
     static let shared = WatchCertificateStore()
     private let keyTag = "gr.orestislef.TVRemote.watchclientkey"
     private let certLabel = "TVRemote Watch Client"
-    private let keyDataKey = "watch_tls_key_data"
+    /// Old builds kept the private key here as a backup nobody read. Only purged now.
+    private let legacyKeyDataKey = "watch_tls_key_data"
+    /// Public data, kept to tell whether an incoming identity is new.
     private let certDataKey = "watch_tls_cert_data"
+
+    private init() {
+        UserDefaults.standard.removeObject(forKey: legacyKeyDataKey)
+    }
 
     // MARK: - Import from iPhone
 
@@ -22,11 +28,8 @@ final class WatchCertificateStore {
     func importIdentity(privateKeyData: Data, certificateData: Data) throws {
         log.info("Importing identity: key=\(privateKeyData.count)B cert=\(certificateData.count)B")
 
-        // Clean up old artifacts
-        deleteExistingKey()
-        deleteExistingCert()
-
-        // Store private key
+        // Parse everything before touching the keychain, and remove the old items
+        // only after the new ones are in. A failed import keeps the working identity.
         let keyAttributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
             kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
@@ -44,6 +47,23 @@ final class WatchCertificateStore {
             throw CertStoreError.keyImportFailed(desc)
         }
         log.info("SecKey created from imported data")
+
+        guard let certificate = SecCertificateCreateWithData(nil, certificateData as CFData) else {
+            log.error("Failed to create SecCertificate from DER data")
+            throw CertStoreError.certImportFailed
+        }
+
+        let summary = SecCertificateCopySubjectSummary(certificate) as String? ?? "unknown"
+        log.info("Certificate created: subject='\(summary)'")
+
+        let oldKeys = existingItems(matching: [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: keyTag.data(using: .utf8)!,
+        ])
+        let oldCerts = existingItems(matching: [
+            kSecClass as String: kSecClassCertificate,
+            kSecAttrLabel as String: certLabel,
+        ])
 
         // Store key in keychain
         let addKeyQuery: [String: Any] = [
@@ -67,14 +87,6 @@ final class WatchCertificateStore {
         }
 
         // Store certificate
-        guard let certificate = SecCertificateCreateWithData(nil, certificateData as CFData) else {
-            log.error("Failed to create SecCertificate from DER data")
-            throw CertStoreError.certImportFailed
-        }
-
-        let summary = SecCertificateCopySubjectSummary(certificate) as String? ?? "unknown"
-        log.info("Certificate created: subject='\(summary)'")
-
         let addCertQuery: [String: Any] = [
             kSecClass as String: kSecClassCertificate,
             kSecValueRef as String: certificate,
@@ -92,10 +104,16 @@ final class WatchCertificateStore {
             throw CertStoreError.keychainError(certStatus)
         }
 
-        // Also persist raw data in UserDefaults as backup
-        UserDefaults.standard.set(privateKeyData, forKey: keyDataKey)
+        // A duplicate means the old item is the new one, so it has to stay.
+        if keyStatus == errSecSuccess { deleteItems(oldKeys, itemClass: kSecClassKey) }
+        if certStatus == errSecSuccess { deleteItems(oldCerts, itemClass: kSecClassCertificate) }
+
         UserDefaults.standard.set(certificateData, forKey: certDataKey)
-        log.info("Identity raw data backed up to UserDefaults")
+    }
+
+    /// True when this certificate is already imported and its identity still resolves.
+    func hasImported(certificateData: Data) -> Bool {
+        UserDefaults.standard.data(forKey: certDataKey) == certificateData && hasIdentity
     }
 
     // MARK: - Retrieve Identity
@@ -122,6 +140,26 @@ final class WatchCertificateStore {
 
     // MARK: - Cleanup
 
+    private func existingItems(matching query: [String: Any]) -> [AnyObject] {
+        var search = query
+        search[kSecMatchLimit as String] = kSecMatchLimitAll
+        search[kSecReturnRef as String] = true
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(search as CFDictionary, &result) == errSecSuccess else { return [] }
+        return result as? [AnyObject] ?? []
+    }
+
+    private func deleteItems(_ items: [AnyObject], itemClass: CFString) {
+        for item in items {
+            let query: [String: Any] = [
+                kSecClass as String: itemClass,
+                kSecValueRef as String: item,
+            ]
+            let status = SecItemDelete(query as CFDictionary)
+            log.debug("deleteItems: OSStatus=\(status)")
+        }
+    }
+
     private func deleteExistingKey() {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
@@ -144,7 +182,7 @@ final class WatchCertificateStore {
         log.info("Deleting all Watch identity data")
         deleteExistingKey()
         deleteExistingCert()
-        UserDefaults.standard.removeObject(forKey: keyDataKey)
+        UserDefaults.standard.removeObject(forKey: legacyKeyDataKey)
         UserDefaults.standard.removeObject(forKey: certDataKey)
     }
 }
