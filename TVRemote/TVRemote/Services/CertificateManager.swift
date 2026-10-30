@@ -41,7 +41,9 @@ final class CertificateManager {
     func getOrCreateIdentity() throws -> SecIdentity {
         log.info("Getting or creating TLS identity...")
 
-        if let identity = findIdentity() {
+        // A keychain error (say, before first unlock) must throw instead of falling
+        // through: regenerating the key would make every TV need pairing again.
+        if let identity = try lookupIdentity() {
             log.info("Found existing identity in Keychain")
             return identity
         }
@@ -74,7 +76,7 @@ final class CertificateManager {
         try addCertificateToKeychain(certificate)
         log.info("Certificate stored in Keychain")
 
-        guard let identity = findIdentity() else {
+        guard let identity = try lookupIdentity() else {
             log.error("Identity not found after storing key + cert - Keychain pairing failed")
             throw CertificateError.identityNotFound
         }
@@ -84,7 +86,7 @@ final class CertificateManager {
     }
 
     func getClientCertificateData() -> Data? {
-        guard let identity = findIdentity() else {
+        guard let identity = try? lookupIdentity() else {
             log.warning("getClientCertificateData: no identity found")
             return nil
         }
@@ -165,7 +167,8 @@ final class CertificateManager {
         }
     }
 
-    private func findIdentity() -> SecIdentity? {
+    /// Nil only when the keychain says there is no identity. Other failures throw.
+    private func lookupIdentity() throws -> SecIdentity? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassIdentity,
             kSecAttrApplicationTag as String: keyTag.data(using: .utf8)!,
@@ -173,12 +176,16 @@ final class CertificateManager {
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecSuccess {
-            log.debug("findIdentity: found (OSStatus=\(status))")
+        switch status {
+        case errSecSuccess:
+            log.debug("lookupIdentity: found")
             return (item as! SecIdentity)
-        } else {
-            log.debug("findIdentity: not found (OSStatus=\(status))")
+        case errSecItemNotFound:
+            log.debug("lookupIdentity: not found")
             return nil
+        default:
+            log.error("lookupIdentity: keychain error OSStatus=\(status)")
+            throw CertificateError.keychainError(status)
         }
     }
 
