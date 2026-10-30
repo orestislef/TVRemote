@@ -2,6 +2,8 @@ import SwiftUI
 
 struct DiscoveryView: View {
     @Environment(TVManager.self) private var tvManager
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var isVisible = false
 
     var body: some View {
         List {
@@ -9,7 +11,7 @@ struct DiscoveryView: View {
                 if tvManager.discovery.isSearching {
                     HStack {
                         ProgressView()
-                        Text("Searching for Android TVs...")
+                        Text("Searching for Android TVs…")
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -38,7 +40,7 @@ struct DiscoveryView: View {
 
                             Spacer()
 
-                            if tvManager.pairedDevices.contains(where: { $0.id == device.id }) {
+                            if tvManager.pairedRecord(matching: device) != nil {
                                 Image(systemName: "checkmark.circle.fill")
                                     .foregroundStyle(.green)
                             }
@@ -65,7 +67,18 @@ struct DiscoveryView: View {
             }
         }
         .onAppear {
+            isVisible = true
             tvManager.discovery.startDiscovery()
+        }
+        .onDisappear {
+            isVisible = false
+            tvManager.discovery.stopDiscovery()
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            // Backgrounding stops the search, and onAppear doesn't fire again on return.
+            if newPhase == .active, isVisible {
+                tvManager.discovery.startDiscovery()
+            }
         }
     }
 }
