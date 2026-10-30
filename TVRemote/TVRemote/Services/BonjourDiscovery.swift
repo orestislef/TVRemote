@@ -6,50 +6,107 @@ import os
 @MainActor
 private let log = Logger(subsystem: "gr.orestislef.TVRemote", category: "Bonjour")
 
+private let serviceType = "_androidtvremote2._tcp"
+private let searchIndicatorSeconds: Double = 8
+
 @Observable
 final class BonjourDiscovery {
+    /// Rebuilt from the live browse results, so a TV that leaves drops off the list.
     var discoveredDevices: [TVDevice] = []
+    /// True for a limited time after a search starts. The browser keeps running
+    /// after this, so a TV that turns up later still appears.
     var isSearching = false
 
-    private var browser: NWBrowser?
+    /// Every successful resolve, which includes a known TV at a new address.
+    @ObservationIgnored var onDeviceResolved: ((TVDevice) -> Void)?
+
+    @ObservationIgnored private var browser: NWBrowser?
+    /// Bumped per browser, so callbacks from an old one are ignored.
+    @ObservationIgnored private var browseID = 0
+    @ObservationIgnored private var resolvers: [String: ServiceResolver] = [:]
+    @ObservationIgnored private var resolved: [String: TVDevice] = [:]
+    @ObservationIgnored private var indicatorTask: Task<Void, Never>?
+    @ObservationIgnored private var isSearchRequested = false
+    @ObservationIgnored private var isProbing = false
 
     func startDiscovery() {
-        guard !isSearching else {
-            log.info("Discovery already running, skipping")
-            return
-        }
+        print("[DISC] Starting Bonjour discovery for \(serviceType)")
+        isSearchRequested = true
         isSearching = true
-        print("[DISC] Starting Bonjour discovery for _androidtvremote2._tcp")
+        resolved = [:]
+        discoveredDevices = []
+        startBrowser()
+
+        indicatorTask?.cancel()
+        indicatorTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(searchIndicatorSeconds))
+            guard !Task.isCancelled else { return }
+            self?.isSearching = false
+        }
+    }
+
+    func stopDiscovery() {
+        log.info("Stopping Bonjour discovery")
+        isSearchRequested = false
+        isSearching = false
+        indicatorTask?.cancel()
+        indicatorTask = nil
+        if !isProbing { stopBrowser() }
+    }
+
+    /// A quiet browse for TVManager that doesn't disturb a search the Discover tab started.
+    func startProbe() {
+        isProbing = true
+        if browser == nil {
+            startBrowser()
+        } else {
+            for name in resolved.keys where resolvers[name] == nil {
+                resolveService(name: name)
+            }
+        }
+    }
+
+    func stopProbe() {
+        isProbing = false
+        if !isSearchRequested { stopBrowser() }
+    }
+
+    private func startBrowser() {
+        stopBrowser()
+        browseID += 1
+        let id = browseID
 
         let params = NWParameters()
         params.includePeerToPeer = true
 
-        let descriptor = NWBrowser.Descriptor.bonjour(type: "_androidtvremote2._tcp", domain: nil)
+        let descriptor = NWBrowser.Descriptor.bonjour(type: serviceType, domain: nil)
         let browser = NWBrowser(for: descriptor, using: params)
 
         browser.stateUpdateHandler = { [weak self] state in
             Task { @MainActor in
+                guard let self, self.browseID == id else { return }
                 switch state {
                 case .ready:
                     print("[DISC] Browser state: ready")
                 case .failed(let error):
                     print("[DISC] Browser state: FAILED - \(error.localizedDescription)")
-                    self?.isSearching = false
+                    self.stopBrowser()
+                    self.isSearching = false
                 case .cancelled:
                     log.info("Browser state: cancelled")
-                    self?.isSearching = false
                 case .waiting(let error):
-                    print("[DISC] Browser state: WAITING - \(error.localizedDescription) (code \((error as? NWError)?.errorCode ?? -1))")
+                    print("[DISC] Browser state: WAITING - \(error.localizedDescription)")
                 default:
                     log.debug("Browser state: \(String(describing: state))")
                 }
             }
         }
 
-        browser.browseResultsChangedHandler = { [weak self] results, changes in
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
             Task { @MainActor in
-                print("[DISC] Browse results changed: \(results.count) results, \(changes.count) changes")
-                self?.handleResults(results)
+                guard let self, self.browseID == id else { return }
+                print("[DISC] Browse results changed: \(results.count) results")
+                self.handleResults(results)
             }
         }
 
@@ -57,33 +114,47 @@ final class BonjourDiscovery {
         self.browser = browser
     }
 
-    func stopDiscovery() {
-        log.info("Stopping Bonjour discovery")
+    private func stopBrowser() {
+        browseID += 1
         browser?.cancel()
         browser = nil
-        isSearching = false
+        for resolver in resolvers.values { resolver.cancel() }
+        resolvers = [:]
     }
 
     private func handleResults(_ results: Set<NWBrowser.Result>) {
+        var names = Set<String>()
         for result in results {
-            if case let .service(name, type, domain, interface) = result.endpoint {
-                print("[DISC] Found service: name='\(name)' type='\(type)' domain='\(domain)'")
-                resolveService(result: result, name: name)
+            if case let .service(name, _, _, _) = result.endpoint {
+                names.insert(name)
             }
+        }
+
+        for (name, resolver) in resolvers where !names.contains(name) {
+            resolver.cancel()
+            resolvers[name] = nil
+        }
+        resolved = resolved.filter { names.contains($0.key) }
+        publishResolved()
+
+        // Resolve again even when known: the name stays the same across an IP change.
+        for name in names where resolvers[name] == nil {
+            resolveService(name: name)
         }
     }
 
-    private var pendingResolvers: [ServiceResolver] = []
-
-    private func resolveService(result: NWBrowser.Result, name: String) {
+    private func resolveService(name: String) {
         print("[DISC] Resolving service '\(name)' via NSNetService...")
+        let id = browseID
         let resolver = ServiceResolver(name: name) { [weak self] ipv4, port in
             Task { @MainActor in
-                guard let self, let ipv4 else {
+                guard let self, self.browseID == id else { return }
+                self.resolvers[name] = nil
+                guard let ipv4 else {
                     print("[DISC] Resolution failed for '\(name)'")
                     return
                 }
-                print("[DISC] ADDED DEVICE: '\(name)' at \(ipv4):\(port)")
+                print("[DISC] Resolved '\(name)' at \(ipv4):\(port)")
                 let device = TVDevice(
                     id: "\(ipv4):\(port)",
                     name: name,
@@ -91,13 +162,18 @@ final class BonjourDiscovery {
                     port: Int(port),
                     isPaired: false
                 )
-                if !self.discoveredDevices.contains(where: { $0.id == device.id }) {
-                    self.discoveredDevices.append(device)
-                }
+                self.resolved[name] = device
+                self.publishResolved()
+                self.onDeviceResolved?(device)
             }
         }
-        pendingResolvers.append(resolver)
+        resolvers[name] = resolver
         resolver.start()
+    }
+
+    private func publishResolved() {
+        let devices = resolved.values.sorted { $0.displayName < $1.displayName }
+        if devices != discoveredDevices { discoveredDevices = devices }
     }
 }
 
@@ -120,6 +196,13 @@ final class ServiceResolver: NSObject, NetServiceDelegate {
             print("[DISC] NSNetService resolution timeout")
             self.finish(nil, 0)
         }
+    }
+
+    /// Stops without calling the completion.
+    func cancel() {
+        guard !finished else { return }
+        finished = true
+        service.stop()
     }
 
     private func finish(_ ip: String?, _ port: UInt16) {
