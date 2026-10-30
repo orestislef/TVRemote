@@ -280,7 +280,7 @@ final class AndroidTVConnection {
                     log.warning("TLS connection WAITING: \(error.localizedDescription)")
                     let mapped = ConnectionError.from(error, path: conn.currentPath)
                     if gate.isDone {
-                        self?.sessionEnded(conn, error: mapped)
+                        Task { @MainActor in self?.sessionEnded(conn, error: mapped) }
                     } else {
                         finish(mapped)
                     }
@@ -288,14 +288,14 @@ final class AndroidTVConnection {
                     log.error("TLS connection FAILED: \(error.localizedDescription)")
                     let mapped = ConnectionError.from(error, path: conn.currentPath)
                     if gate.isDone {
-                        self?.sessionEnded(conn, error: mapped)
+                        Task { @MainActor in self?.sessionEnded(conn, error: mapped) }
                     } else {
                         finish(mapped)
                     }
                 case .cancelled:
                     log.info("TLS connection CANCELLED")
                     if gate.isDone {
-                        self?.sessionEnded(conn, error: .sessionLost)
+                        Task { @MainActor in self?.sessionEnded(conn, error: .sessionLost) }
                     } else {
                         finish(.cancelled)
                     }

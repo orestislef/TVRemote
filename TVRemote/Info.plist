@@ -7,5 +7,7 @@
 		<string>_androidtvremote2._tcp.</string>
 		<string>_googlecast._tcp.</string>
 	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>TVRemote needs local network access to discover and control Android TVs on your network.</string>
 </dict>
 </plist>
